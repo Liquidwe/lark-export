@@ -1,0 +1,151 @@
+:root {
+  --bg: #f6f7f9;
+  --panel: #ffffff;
+  --text: #1f2329;
+  --muted: #646a73;
+  --line: #e4e6ea;
+  --accent: #2b5fd9;
+  --accent-soft: #e8eefc;
+  --ok: #1a7f4e;
+  --warn: #a8660b;
+  --bad: #c0352b;
+  color-scheme: light dark;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #17191c;
+    --panel: #212429;
+    --text: #e8eaed;
+    --muted: #9aa0a8;
+    --line: #33373d;
+    --accent: #7ea2f5;
+    --accent-soft: #27324a;
+    --ok: #57c28d;
+    --warn: #e0a84e;
+    --bad: #ef7d73;
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.6 -apple-system, BlinkMacSystemFont, "PingFang SC", "Segoe UI", sans-serif;
+}
+
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+.topbar { border-bottom: 1px solid var(--line); background: var(--panel); padding: 12px 24px; }
+.brand { color: var(--text); font-weight: 600; font-size: 15px; }
+.page { max-width: 1040px; margin: 0 auto; padding: 24px 16px 64px; }
+
+h1 { font-size: 22px; margin: 0 0 4px; overflow-wrap: anywhere; }
+h2 { font-size: 15px; margin: 0 0 12px; }
+.sub { color: var(--muted); margin: 0 0 20px; overflow-wrap: anywhere; }
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 16px;
+  margin-bottom: 16px;
+}
+
+.form-row { display: flex; gap: 8px; flex-wrap: wrap; }
+input[type="url"] {
+  flex: 1 1 280px;
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+}
+input[type="url"]:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+
+button {
+  padding: 8px 14px;
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  background: var(--accent);
+  color: #fff;
+  font: inherit;
+  font-weight: 500;
+  cursor: pointer;
+}
+button.secondary { background: transparent; color: var(--accent); }
+button:disabled { opacity: 0.5; cursor: default; }
+
+.error {
+  color: var(--bad);
+  margin-top: 8px;
+  overflow-wrap: anywhere;
+}
+.hint { color: var(--muted); font-size: 13px; margin: 8px 0 0; }
+
+.job {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 0;
+  border-top: 1px solid var(--line);
+  color: inherit;
+}
+.job:first-of-type { border-top: 0; }
+.job:hover { text-decoration: none; }
+.job:hover .job-title { color: var(--accent); }
+.job-title { font-weight: 500; overflow-wrap: anywhere; }
+.job-meta { color: var(--muted); font-size: 13px; }
+
+.badge {
+  flex: none;
+  align-self: flex-start;
+  padding: 1px 8px;
+  border-radius: 10px;
+  background: var(--line);
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.badge.done { color: var(--ok); }
+.badge.running, .badge.created, .badge.pending { color: var(--accent); background: var(--accent-soft); }
+.badge.partial, .badge.unsupported, .badge.placeholder, .badge.interrupted { color: var(--warn); }
+.badge.failed { color: var(--bad); }
+
+.tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+  gap: 8px;
+  margin-bottom: 16px;
+}
+.tile { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px; }
+.tile-value { font-size: 24px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.tile-label { color: var(--muted); font-size: 13px; }
+
+.facts { color: var(--muted); font-size: 13px; margin: 0; }
+
+.tree { list-style: none; margin: 0; padding: 0; }
+.tree-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 6px 0;
+  border-top: 1px solid var(--line);
+}
+.tree-row:first-child { border-top: 0; }
+.tree-main { flex: 1; min-width: 0; }
+.tree-title { overflow-wrap: anywhere; }
+.tree-type { color: var(--muted); font-size: 12px; margin-left: 6px; }
+.tree-stats { color: var(--muted); font-size: 12px; }
+.note { font-size: 12px; color: var(--warn); overflow-wrap: anywhere; }
+.note.bad { color: var(--bad); }
+
+.migration { border-top: 1px solid var(--line); padding-top: 12px; margin-top: 12px; }
+.progress { height: 6px; border-radius: 3px; background: var(--line); overflow: hidden; margin: 8px 0; }
+.progress > div { height: 100%; background: var(--accent); transition: width 0.3s; }
+.spread { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; flex-wrap: wrap; }

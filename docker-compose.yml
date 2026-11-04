@@ -1,0 +1,20 @@
+services:
+  lark-export:
+    build: .
+    image: lark-export
+    restart: unless-stopped
+    init: true
+    env_file: .env
+    environment:
+      # These describe the inside of the container, so they override whatever .env says.
+      HOST: 0.0.0.0
+      PORT: 4310
+      DATA_DIR: /app/data
+    ports:
+      # Published on localhost only: the tool has no login and holds the bots' credentials.
+      - "127.0.0.1:${PORT:-4310}:4310"
+    volumes:
+      - lark-export-data:/app/data
+
+volumes:
+  lark-export-data:

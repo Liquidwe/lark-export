@@ -1,0 +1,271 @@
+// Minimal Lark Open API client: tenant auth, throttling, retries, pagination, upload/download.
+
+const MIN_INTERVAL_MS = 220;
+const MAX_RETRIES = 6;
+const SINGLE_UPLOAD_LIMIT = 20 * 1024 * 1024;
+const RETRYABLE_CODES = new Set([99991400, 1254290, 1770064, 90217]);
+
+export class LarkApiError extends Error {
+  constructor(message, { code, status, scopes, logId } = {}) {
+    super(message);
+    this.name = 'LarkApiError';
+    this.code = code;
+    this.status = status;
+    this.scopes = scopes || [];
+    this.logId = logId;
+  }
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Parses a wiki URL into its host, token and the matching API base.
+export function parseWikiUrl(input) {
+  let url;
+  try {
+    url = new URL(String(input).trim());
+  } catch {
+    throw new Error('链接格式不正确');
+  }
+  const match = url.pathname.match(/^\/wiki\/([A-Za-z0-9]+)/);
+  if (!match || match[1] === 'settings') {
+    throw new Error('目前仅支持知识库链接，形如 https://xxx.larksuite.com/wiki/<token>');
+  }
+  const isFeishu = /(^|\.)feishu\.cn$/.test(url.hostname);
+  const isLark = /(^|\.)larksuite\.com$/.test(url.hostname);
+  if (!isFeishu && !isLark) throw new Error('链接不是 Lark 或飞书域名');
+  return {
+    host: url.origin,
+    token: match[1],
+    apiBase: isFeishu ? 'https://open.feishu.cn/open-apis' : 'https://open.larksuite.com/open-apis',
+  };
+}
+
+export class LarkClient {
+  constructor({ appId, appSecret, apiBase }) {
+    if (!appId || !appSecret) throw new Error('缺少机器人的 App ID 或 App Secret 环境变量');
+    this.appId = appId;
+    this.appSecret = appSecret;
+    this.apiBase = apiBase;
+    this.cachedToken = null;
+    this.tokenExpiresAt = 0;
+    this.nextSlot = 0;
+  }
+
+  async token() {
+    if (this.cachedToken && Date.now() < this.tokenExpiresAt) return this.cachedToken;
+    const res = await fetch(`${this.apiBase}/auth/v3/tenant_access_token/internal`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ app_id: this.appId, app_secret: this.appSecret }),
+    });
+    const json = await res.json();
+    if (json.code !== 0) throw new LarkApiError(`机器人鉴权失败: ${json.msg}`, { code: json.code });
+    this.cachedToken = json.tenant_access_token;
+    this.tokenExpiresAt = Date.now() + (json.expire - 120) * 1000;
+    return this.cachedToken;
+  }
+
+  async throttle() {
+    const now = Date.now();
+    const wait = Math.max(0, this.nextSlot - now);
+    this.nextSlot = Math.max(now, this.nextSlot) + MIN_INTERVAL_MS;
+    if (wait) await sleep(wait);
+  }
+
+  buildUrl(path, query) {
+    const url = new URL(`${this.apiBase}${path}`);
+    for (const [key, value] of Object.entries(query || {})) {
+      if (value !== undefined && value !== null) url.searchParams.set(key, value);
+    }
+    return url;
+  }
+
+  // Sends a request with retries. makeBody is a function so multipart bodies can be rebuilt.
+  async send(method, path, { query, makeBody, json } = {}) {
+    // A 5xx or dropped connection may follow a write that did apply, so a POST is only
+    // resent when a duplicate is impossible. Uploads are safe: a repeat just orphans a file.
+    const canResend = method !== 'POST' || Boolean(makeBody) || Boolean(query?.client_token);
+    let lastError;
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      if (attempt) await sleep(Math.min(500 * 2 ** attempt, 15000));
+      await this.throttle();
+      const headers = { Authorization: `Bearer ${await this.token()}` };
+      if (json !== undefined) headers['Content-Type'] = 'application/json; charset=utf-8';
+      let res;
+      try {
+        res = await fetch(this.buildUrl(path, query), {
+          method,
+          headers,
+          body: json !== undefined ? JSON.stringify(json) : makeBody?.(),
+        });
+      } catch (err) {
+        if (!canResend) throw err;
+        lastError = err;
+        continue;
+      }
+      if (res.status === 429 || res.status >= 500) {
+        lastError = new LarkApiError(`HTTP ${res.status}: ${path}`, { status: res.status });
+        await res.body?.cancel();
+        if (res.status !== 429 && !canResend) throw lastError;
+        continue;
+      }
+      return res;
+    }
+    throw lastError;
+  }
+
+  async request(method, path, { query, body, makeBody } = {}) {
+    for (let attempt = 0; ; attempt++) {
+      const res = await this.send(method, path, { query, json: body, makeBody });
+      const text = await res.text();
+      let payload;
+      try {
+        payload = JSON.parse(text);
+      } catch {
+        throw new LarkApiError(`接口返回非 JSON (HTTP ${res.status}): ${path}`, { status: res.status });
+      }
+      if (payload.code === 0) return payload.data ?? {};
+      if (RETRYABLE_CODES.has(payload.code) && attempt < MAX_RETRIES) {
+        await sleep(Math.min(1000 * 2 ** attempt, 15000));
+        continue;
+      }
+      throw toApiError(payload, res.status, path);
+    }
+  }
+
+  get(path, query) {
+    return this.request('GET', path, { query });
+  }
+
+  post(path, body, query) {
+    return this.request('POST', path, { body: body ?? {}, query });
+  }
+
+  patch(path, body, query) {
+    return this.request('PATCH', path, { body, query });
+  }
+
+  delete(path, query) {
+    return this.request('DELETE', path, { query });
+  }
+
+  async all(path, query = {}, itemsKey = 'items') {
+    const items = [];
+    let pageToken;
+    do {
+      const data = await this.get(path, { ...query, page_token: pageToken });
+      items.push(...(data[itemsKey] || []));
+      pageToken = data.has_more ? data.page_token : undefined;
+    } while (pageToken);
+    return items;
+  }
+
+  async download(path, query) {
+    const res = await this.send('GET', path, { query });
+    const contentType = res.headers.get('content-type') || '';
+    if (contentType.includes('application/json')) {
+      const payload = await res.json();
+      throw toApiError(payload, res.status, path);
+    }
+    if (!res.ok) throw new LarkApiError(`下载失败 HTTP ${res.status}: ${path}`, { status: res.status });
+    const disposition = res.headers.get('content-disposition') || '';
+    return {
+      buffer: Buffer.from(await res.arrayBuffer()),
+      contentType,
+      fileName: parseFileName(disposition),
+    };
+  }
+
+  // Uploads via medias (or files) API, switching to chunked mode above the single-request limit.
+  async upload({ api = 'medias', buffer, fileName, parentType, parentNode, extra }) {
+    if (buffer.length <= SINGLE_UPLOAD_LIMIT) {
+      const data = await this.request('POST', `/drive/v1/${api}/upload_all`, {
+        makeBody: () => {
+          const form = new FormData();
+          form.set('file_name', fileName);
+          form.set('parent_type', parentType);
+          if (parentNode !== undefined) form.set('parent_node', parentNode);
+          form.set('size', String(buffer.length));
+          if (extra) form.set('extra', extra);
+          form.set('file', new Blob([buffer]), fileName);
+          return form;
+        },
+      });
+      return data.file_token;
+    }
+    const prepared = await this.post(`/drive/v1/${api}/upload_prepare`, {
+      file_name: fileName,
+      parent_type: parentType,
+      parent_node: parentNode,
+      size: buffer.length,
+      extra,
+    });
+    for (let seq = 0; seq < prepared.block_num; seq++) {
+      const chunk = buffer.subarray(seq * prepared.block_size, (seq + 1) * prepared.block_size);
+      await this.request('POST', `/drive/v1/${api}/upload_part`, {
+        makeBody: () => {
+          const form = new FormData();
+          form.set('upload_id', prepared.upload_id);
+          form.set('seq', String(seq));
+          form.set('size', String(chunk.length));
+          form.set('file', new Blob([chunk]), fileName);
+          return form;
+        },
+      });
+    }
+    const finished = await this.post(`/drive/v1/${api}/upload_finish`, {
+      upload_id: prepared.upload_id,
+      block_num: prepared.block_num,
+    });
+    return finished.file_token;
+  }
+}
+
+function toApiError(payload, status, path) {
+  const violations = payload.error?.permission_violations || [];
+  const scopes = violations.map((v) => v.subject);
+  let message = `${payload.msg || '接口错误'} (code=${payload.code}, ${path})`;
+  if (scopes.length) message = `机器人缺少权限，需要以下任一权限: ${scopes.join(', ')} (${path})`;
+  return new LarkApiError(message, {
+    code: payload.code,
+    status,
+    scopes,
+    logId: payload.error?.log_id,
+  });
+}
+
+function parseFileName(disposition) {
+  const star = disposition.match(/filename\*=(?:UTF-8'')?([^;]+)/i);
+  if (star) {
+    try {
+      return decodeURIComponent(star[1].trim());
+    } catch {
+      return star[1].trim();
+    }
+  }
+  const plain = disposition.match(/filename="?([^";]+)"?/i);
+  return plain ? plain[1] : null;
+}
+
+// Converts a 1-based column index to spreadsheet letters (1 -> A, 27 -> AA).
+export function columnName(index) {
+  let name = '';
+  for (let n = index; n > 0; n = Math.floor((n - 1) / 26)) {
+    name = String.fromCharCode(65 + ((n - 1) % 26)) + name;
+  }
+  return name;
+}
+
+export function pollDelay(attempt) {
+  return sleep(Math.min(1000 + attempt * 500, 5000));
+}
+
+// Source and target bots may differ: a cross-org migration needs one app in each tenant.
+export function clientFor(role, apiBase) {
+  const useTarget = role === 'target' && process.env.LARK_TARGET_APP_ID;
+  return new LarkClient({
+    appId: useTarget ? process.env.LARK_TARGET_APP_ID : process.env.LARK_APP_ID,
+    appSecret: useTarget ? process.env.LARK_TARGET_APP_SECRET : process.env.LARK_APP_SECRET,
+    apiBase,
+  });
+}

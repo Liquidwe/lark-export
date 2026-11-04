@@ -1,0 +1,12 @@
+{
+  "name": "lark-export",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Migrate Lark wiki trees between organizations via a local database",
+  "engines": { "node": ">=22.13" },
+  "scripts": {
+    "start": "node --env-file-if-exists=.env --disable-warning=ExperimentalWarning src/server.js",
+    "test": "node --disable-warning=ExperimentalWarning --test test/*.test.js"
+  }
+}

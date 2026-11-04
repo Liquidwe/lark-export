@@ -1,0 +1,287 @@
+// Reads a wiki subtree into the local database and blob directory.
+
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { BLOB_DIR, db } from './db.js';
+import { clientFor, columnName, parseWikiUrl, pollDelay } from './lark.js';
+
+const BLOCK_IMAGE = 27;
+const BLOCK_FILE = 23;
+const BLOCK_SHEET = 30;
+const BLOCK_BOARD = 43;
+const BITABLE_ATTACHMENT = 17;
+// One past the writer's 100x100 limit, so the writer can tell when it truncated.
+const MAX_EMBED_ROWS = 101;
+const MAX_EMBED_COLUMNS = 101;
+
+export function startExport(sourceUrl) {
+  const { host, token, apiBase } = parseWikiUrl(sourceUrl);
+  const { lastInsertRowid } = db
+    .prepare(
+      `INSERT INTO exports (source_url, host, api_base, root_token, phase, created_at)
+       VALUES (?, ?, ?, ?, 'tree', ?)`,
+    )
+    .run(sourceUrl.trim(), host, apiBase, token, Date.now());
+  const id = Number(lastInsertRowid);
+  runExport(id).catch((err) => failExport(id, err));
+  return id;
+}
+
+// Re-reads only the nodes that did not complete, reusing the stored tree when one exists.
+export function resumeExport(id) {
+  db.prepare(`UPDATE nodes SET status = 'pending', error = NULL WHERE export_id = ? AND status = 'failed'`).run(id);
+  db.prepare(`UPDATE exports SET status = 'running', error = NULL, finished_at = NULL WHERE id = ?`).run(id);
+  runExport(id).catch((err) => failExport(id, err));
+}
+
+function failExport(id, err) {
+  db.prepare(`UPDATE exports SET status = 'failed', error = ?, finished_at = ? WHERE id = ?`).run(
+    err.message,
+    Date.now(),
+    id,
+  );
+}
+
+async function runExport(id) {
+  const job = db.prepare('SELECT * FROM exports WHERE id = ?').get(id);
+  const client = clientFor('source', job.api_base);
+
+  // A walk that died midway leaves a partial tree, which must not pass for the whole subtree.
+  if (!job.tree_complete) {
+    db.prepare('DELETE FROM nodes WHERE export_id = ?').run(id);
+    db.prepare(`UPDATE exports SET phase = 'tree' WHERE id = ?`).run(id);
+    await readTree(client, job);
+    db.prepare('UPDATE exports SET tree_complete = 1 WHERE id = ?').run(id);
+  }
+
+  db.prepare(`UPDATE exports SET phase = 'content' WHERE id = ?`).run(id);
+  const pending = db
+    .prepare(`SELECT * FROM nodes WHERE export_id = ? AND status = 'pending' ORDER BY position`)
+    .all(id);
+  for (const node of pending) {
+    try {
+      await readNode(client, job, node);
+    } catch (err) {
+      db.prepare(`UPDATE nodes SET status = 'failed', error = ? WHERE id = ?`).run(err.message, node.id);
+    }
+  }
+
+  const failed = db
+    .prepare(`SELECT COUNT(*) AS n FROM nodes WHERE export_id = ? AND status = 'failed'`)
+    .get(id).n;
+  db.prepare(`UPDATE exports SET status = ?, phase = NULL, finished_at = ? WHERE id = ?`).run(
+    failed ? 'partial' : 'done',
+    Date.now(),
+    id,
+  );
+}
+
+async function readTree(client, job) {
+  const { node: root } = await client.get('/wiki/v2/spaces/get_node', { token: job.root_token });
+  db.prepare('UPDATE exports SET root_title = ? WHERE id = ?').run(root.title, job.id);
+
+  const insert = db.prepare(
+    `INSERT INTO nodes (export_id, node_token, parent_token, obj_token, obj_type, node_type,
+                        origin_node_token, title, depth, position)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  );
+  let position = 0;
+  const visit = async (node, parentToken, depth) => {
+    insert.run(
+      job.id,
+      node.node_token,
+      parentToken,
+      node.obj_token,
+      node.obj_type,
+      node.node_type,
+      node.origin_node_token ?? null,
+      node.title,
+      depth,
+      position++,
+    );
+    if (!node.has_child) return;
+    const children = await client.all(`/wiki/v2/spaces/${node.space_id}/nodes`, {
+      parent_node_token: node.node_token,
+      page_size: 50,
+    });
+    for (const child of children) await visit(child, node.node_token, depth + 1);
+  };
+  await visit(root, null, 0);
+}
+
+async function readNode(client, job, node) {
+  const saved = (kind, token, buffer, fileName) => saveAsset(job.id, node, kind, token, buffer, fileName);
+  let result;
+  if (node.node_type === 'shortcut') {
+    result = { stats: {}, warnings: [] };
+  } else if (node.obj_type === 'docx') {
+    result = await readDocx(client, node, saved);
+  } else if (node.obj_type === 'sheet') {
+    result = await readSheet(client, node, saved);
+  } else if (node.obj_type === 'bitable') {
+    result = await readBitable(client, node, saved);
+  } else if (node.obj_type === 'file') {
+    result = await readFile(client, node, saved);
+  } else {
+    db.prepare(`UPDATE nodes SET status = 'unsupported', warnings = ? WHERE id = ?`).run(
+      JSON.stringify([`Lark 暂未提供 ${node.obj_type} 类型的读取接口，迁移时会生成占位文档`]),
+      node.id,
+    );
+    return;
+  }
+  db.prepare(`UPDATE nodes SET status = 'done', content = ?, stats = ?, warnings = ? WHERE id = ?`).run(
+    result.content ? JSON.stringify(result.content) : null,
+    JSON.stringify(result.stats),
+    JSON.stringify(result.warnings),
+    node.id,
+  );
+}
+
+function saveAsset(exportId, node, kind, token, buffer, fileName) {
+  // Stored relative to the blob directory, so the data folder can move (for example into a container).
+  const path = join(String(exportId), String(node.id), `${kind}-${token}`);
+  mkdirSync(dirname(join(BLOB_DIR, path)), { recursive: true });
+  writeFileSync(join(BLOB_DIR, path), buffer);
+  db.prepare(
+    `INSERT OR REPLACE INTO assets (export_id, node_id, kind, token, file_name, path, size)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  ).run(exportId, node.id, kind, token, fileName ?? null, path, buffer.length);
+}
+
+async function readDocx(client, node, saved) {
+  const blocks = await client.all(`/docx/v1/documents/${node.obj_token}/blocks`, {
+    page_size: 500,
+    document_revision_id: -1,
+  });
+  const warnings = [];
+  const stats = { blocks: blocks.length, images: 0, files: 0, boards: 0, embeds: 0 };
+  const embeddedSheets = {};
+  const boards = {};
+
+  for (const block of blocks) {
+    if (block.block_type === BLOCK_IMAGE && block.image?.token) {
+      const file = await client.download(`/drive/v1/medias/${block.image.token}/download`);
+      saved('image', block.image.token, file.buffer, file.fileName);
+      stats.images++;
+    } else if (block.block_type === BLOCK_FILE && block.file?.token) {
+      const file = await client.download(`/drive/v1/medias/${block.file.token}/download`);
+      saved('file', block.file.token, file.buffer, file.fileName ?? block.file.name);
+      stats.files++;
+    } else if (block.block_type === BLOCK_BOARD && block.board?.token) {
+      const { nodes = [] } = await client.get(`/board/v1/whiteboards/${block.board.token}/nodes`);
+      for (const boardNode of nodes) {
+        if (!boardNode.image?.token) continue;
+        const file = await client.download(`/drive/v1/medias/${boardNode.image.token}/download`);
+        saved('board-image', boardNode.image.token, file.buffer, file.fileName);
+      }
+      boards[block.block_id] = nodes;
+      stats.boards++;
+    } else if (block.block_type === BLOCK_SHEET && block.sheet?.token) {
+      // One unreadable embed should cost that block, not the whole document.
+      try {
+        embeddedSheets[block.block_id] = await readEmbeddedSheet(client, block.sheet.token);
+        stats.embeds++;
+        warnings.push('内嵌电子表格只迁移单元格的值，样式不保留');
+      } catch (err) {
+        warnings.push(`有内嵌电子表格读取失败，迁移后为空表: ${err.message}`);
+      }
+    }
+  }
+  return { content: { blocks, embeddedSheets, boards }, stats, warnings: [...new Set(warnings)] };
+}
+
+async function readEmbeddedSheet(client, token) {
+  const separator = token.lastIndexOf('_');
+  const spreadsheet = token.slice(0, separator);
+  const sheetId = token.slice(separator + 1);
+  const { sheet } = await client.get(`/sheets/v3/spreadsheets/${spreadsheet}/sheets/${sheetId}`);
+  const rows = Math.min(sheet.grid_properties.row_count, MAX_EMBED_ROWS);
+  const columns = Math.min(sheet.grid_properties.column_count, MAX_EMBED_COLUMNS);
+  const data = await client.get(
+    `/sheets/v2/spreadsheets/${spreadsheet}/values/${sheetId}!A1:${columnName(columns)}${rows}`,
+    { valueRenderOption: 'FormattedValue' },
+  );
+  return trimGrid(data.valueRange?.values ?? []);
+}
+
+// Sheets report their full grid, so drop the empty margin before sizing the new block.
+function trimGrid(values) {
+  const isEmpty = (cell) => cell === null || cell === undefined || cell === '';
+  const rows = values.map((row) => {
+    let end = row.length;
+    while (end > 0 && isEmpty(row[end - 1])) end--;
+    return row.slice(0, end);
+  });
+  while (rows.length && rows[rows.length - 1].length === 0) rows.pop();
+  return rows;
+}
+
+async function readSheet(client, node, saved) {
+  const { sheets = [] } = await client.get(`/sheets/v3/spreadsheets/${node.obj_token}/sheets/query`);
+  const buffer = await exportToBuffer(client, node.obj_token, 'sheet', 'xlsx');
+  saved('xlsx', node.obj_token, buffer, `${node.title || 'sheet'}.xlsx`);
+  return {
+    stats: { sheets: sheets.length, size: buffer.length },
+    warnings: ['电子表格经 xlsx 导入，单元格中的 @人员 会变为文本'],
+  };
+}
+
+async function exportToBuffer(client, token, type, extension) {
+  const { ticket } = await client.post('/drive/v1/export_tasks', { file_extension: extension, token, type });
+  for (let attempt = 0; attempt < 120; attempt++) {
+    const { result } = await client.get(`/drive/v1/export_tasks/${ticket}`, { token });
+    if (result.job_status === 0) {
+      const file = await client.download(`/drive/v1/export_tasks/file/${result.file_token}/download`);
+      return file.buffer;
+    }
+    if (result.job_status !== 1 && result.job_status !== 2) {
+      throw new Error(`导出失败: ${result.job_error_msg || result.job_status}`);
+    }
+    await pollDelay(attempt);
+  }
+  throw new Error('导出超时');
+}
+
+async function readBitable(client, node, saved) {
+  const app = node.obj_token;
+  const tables = await client.all(`/bitable/v1/apps/${app}/tables`, { page_size: 100 });
+  const stats = { tables: tables.length, fields: 0, records: 0, attachments: 0 };
+  const content = { tables: [] };
+
+  for (const table of tables) {
+    const base = `/bitable/v1/apps/${app}/tables/${table.table_id}`;
+    const fields = await client.all(`${base}/fields`, { page_size: 100 });
+    const views = await client.all(`${base}/views`, { page_size: 100 });
+    const records = await client.all(`${base}/records`, { page_size: 500 });
+    stats.fields += fields.length;
+    stats.records += records.length;
+
+    const attachmentFields = fields.filter((f) => f.type === BITABLE_ATTACHMENT).map((f) => f.field_name);
+    const seen = new Set();
+    for (const record of records) {
+      for (const name of attachmentFields) {
+        for (const item of record.fields[name] || []) {
+          if (seen.has(item.file_token)) continue;
+          seen.add(item.file_token);
+          const file = await client.download(`/drive/v1/medias/${item.file_token}/download`);
+          saved('attachment', item.file_token, file.buffer, item.name);
+          stats.attachments++;
+        }
+      }
+    }
+    content.tables.push({
+      table_id: table.table_id,
+      name: table.name,
+      fields,
+      views,
+      records: records.map(({ record_id, fields: values }) => ({ record_id, fields: values })),
+    });
+  }
+  return { content, stats, warnings: [] };
+}
+
+async function readFile(client, node, saved) {
+  const file = await client.download(`/drive/v1/files/${node.obj_token}/download`);
+  saved('file', node.obj_token, file.buffer, file.fileName ?? node.title);
+  return { stats: { size: file.buffer.length }, warnings: [] };
+}
