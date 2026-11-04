@@ -93,8 +93,9 @@ db.exec(`
 
 // A restart kills in-process jobs, so anything still "running" can never finish on its own.
 db.exec(`
-  UPDATE exports SET status = 'interrupted' WHERE status = 'running';
-  UPDATE migrations SET status = 'interrupted' WHERE status = 'running';
+  UPDATE exports SET status = 'interrupted' WHERE status IN ('running', 'pausing');
+  UPDATE migrations SET status = 'interrupted' WHERE status IN ('running', 'pausing');
+  UPDATE nodes SET status = 'pending' WHERE status = 'reading';
 `);
 
 export const parseJson = (value, fallback = null) => (value ? JSON.parse(value) : fallback);

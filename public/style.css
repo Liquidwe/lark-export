@@ -113,8 +113,8 @@ button:disabled { opacity: 0.5; cursor: default; }
   white-space: nowrap;
 }
 .badge.done { color: var(--ok); }
-.badge.running, .badge.created, .badge.pending { color: var(--accent); background: var(--accent-soft); }
-.badge.partial, .badge.unsupported, .badge.placeholder, .badge.interrupted { color: var(--warn); }
+.badge.running, .badge.created, .badge.pending, .badge.reading { color: var(--accent); background: var(--accent-soft); }
+.badge.partial, .badge.unsupported, .badge.placeholder, .badge.interrupted, .badge.paused, .badge.pausing { color: var(--warn); }
 .badge.failed { color: var(--bad); }
 
 .tiles {
@@ -128,6 +128,10 @@ button:disabled { opacity: 0.5; cursor: default; }
 .tile-label { color: var(--muted); font-size: 13px; }
 
 .facts { color: var(--muted); font-size: 13px; margin: 0; }
+.actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.actions:not(:empty) { margin-top: 8px; }
+.hint-inline { color: var(--muted); font-size: 13px; }
+button.small { flex: none; padding: 1px 10px; font-size: 12px; }
 
 .tree { list-style: none; margin: 0; padding: 0; }
 .tree-row {

@@ -16,6 +16,9 @@ const TYPE_LABELS = {
 const STATUS_LABELS = {
   running: '进行中',
   pending: '等待中',
+  reading: '读取中',
+  pausing: '暂停中',
+  paused: '已暂停',
   created: '已建节点',
   done: '已完成',
   partial: '部分失败',
@@ -40,6 +43,8 @@ const STAT_LABELS = {
 const esc = (value) =>
   String(value ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
 
+const isActive = (status) => status === 'running' || status === 'pausing';
+const canContinue = (status) => status === 'paused' || status === 'interrupted' || status === 'failed';
 const typeLabel = (type) => TYPE_LABELS[type] || type;
 const badge = (status) => `<span class="badge ${esc(status)}">${esc(STATUS_LABELS[status] || status)}</span>`;
 
@@ -115,7 +120,7 @@ async function showHome() {
       showHome();
     }
   });
-  schedule(route, jobs.some((job) => job.status === 'running'));
+  schedule(route, jobs.some((job) => isActive(job.status)));
 }
 
 function jobRow(job) {
@@ -134,7 +139,10 @@ function jobRow(job) {
 async function showExport(id) {
   const job = await api(`/api/exports/${id}`);
   const finishedRead = (job.byStatus.done || 0) + (job.byStatus.unsupported || 0) + (job.byStatus.failed || 0);
-  const migrating = job.migrations.some((m) => m.status === 'running');
+  const migrating = job.migrations.some((m) => isActive(m.status));
+  const failedCount = job.byStatus.failed || 0;
+  const unread = (job.byStatus.pending || 0) + (job.byStatus.reading || 0);
+  const failedNodes = job.nodes.filter((node) => node.status === 'failed');
   const totals = Object.entries(job.totals)
     .filter(([key]) => STAT_LABELS[key])
     .map(([key, value]) => `${STAT_LABELS[key]} ${value}`)
@@ -161,24 +169,36 @@ async function showExport(id) {
 
     <section class="panel">
       <p class="facts">已读取 ${finishedRead} / ${job.total}${totals ? ` · ${esc(totals)}` : ''}</p>
-      ${job.status === 'partial' || job.status === 'interrupted' || job.status === 'failed'
-        ? '<p class="hint"><button id="resume-export" class="secondary">重试未完成的节点</button></p>' : ''}
+      <div class="actions">
+        ${job.status === 'running' ? '<button class="secondary" data-action="pause-export">暂停</button>' : ''}
+        ${job.status === 'pausing' ? `<button class="secondary" disabled>暂停中…</button>
+          <span class="hint-inline">${job.phase === 'tree' ? '目录读取完成后暂停' : '正在处理的文档完成后暂停'}</span>` : ''}
+        ${canContinue(job.status) ? '<button data-action="resume-export">继续</button>' : ''}
+        ${failedCount && !isActive(job.status) ? `<button class="secondary" data-action="retry-failed">重试全部失败的文档 (${failedCount})</button>` : ''}
+      </div>
     </section>
+
+    ${failedNodes.length ? `
+      <section class="panel">
+        <h2>读取失败的文档 (${failedNodes.length})</h2>
+        <ul class="tree">${failedNodes.map((node) => nodeRow({ ...node, depth: 0 })).join('')}</ul>
+      </section>` : ''}
 
     <section class="panel">
       <h2>写回到另一个位置</h2>
       <form id="migrate" class="form-row">
         <input id="target-url" type="url" required value="${esc(draft.target)}"
           placeholder="目标知识库节点链接，内容会成为它的子节点" aria-label="目标文档链接" />
-        <button type="submit" ${job.status === 'running' || migrating || !job.tree_complete ? 'disabled' : ''}>开始迁移</button>
+        <button type="submit" ${isActive(job.status) || migrating || !job.tree_complete || unread ? 'disabled' : ''}>开始迁移</button>
       </form>
+      ${unread && !isActive(job.status) ? `<p class="hint">还有 ${unread} 个文档没有读取完，继续读取后才能迁移。</p>` : ''}
       ${draft.error ? `<p class="error">${esc(draft.error)}</p>` : ''}
       ${job.migrations.map(migrationBlock).join('')}
     </section>
 
     <section class="panel">
       <h2>文档结构</h2>
-      <ul class="tree">${job.nodes.map(nodeRow).join('') || `<li class="hint">${job.status === 'running' ? '正在读取目录…' : '没有读取到节点'}</li>`}</ul>
+      <ul class="tree">${job.nodes.map(nodeRow).join('') || `<li class="hint">${isActive(job.status) ? '正在读取目录…' : '没有读取到节点'}</li>`}</ul>
     </section>
   `);
 
@@ -197,19 +217,33 @@ async function showExport(id) {
     }
     route();
   });
-  document.getElementById('resume-export')?.addEventListener('click', async () => {
-    await api(`/api/exports/${id}/resume`, {});
-    route();
-  });
-  document.querySelectorAll('[data-resume-migration]').forEach((button) => {
-    button.addEventListener('click', async () => {
-      await api(`/api/migrations/${button.dataset.resumeMigration}/resume`, {});
-      route();
-    });
-  });
   keepInput('target-url', draft.target);
-  schedule(route, job.status === 'running' || migrating);
+  schedule(route, isActive(job.status) || migrating || (job.byStatus.reading || 0) > 0);
 }
+
+// Handled by delegation: polling replaces these buttons, and a click landing across
+// a redraw would be lost if the listener lived on the button itself.
+const ACTIONS = {
+  'pause-export': ({ exportId }) => api(`/api/exports/${exportId}/pause`, {}),
+  'resume-export': ({ exportId }) => api(`/api/exports/${exportId}/resume`, {}),
+  'retry-failed': ({ exportId }) => api(`/api/exports/${exportId}/resume`, { retryFailed: true }),
+  'retry-node': ({ exportId, target }) => api(`/api/exports/${exportId}/nodes/${target}/retry`, {}),
+  'pause-migration': ({ target }) => api(`/api/migrations/${target}/pause`, {}),
+  'resume-migration': ({ target }) => api(`/api/migrations/${target}/resume`, {}),
+};
+
+app.addEventListener('click', async (event) => {
+  const button = event.target.closest('[data-action]');
+  if (!button) return;
+  const exportId = location.hash.match(/^#\/exports\/(\d+)/)?.[1];
+  try {
+    await ACTIONS[button.dataset.action]({ exportId, target: button.dataset.target });
+    draft.error = '';
+  } catch (err) {
+    draft.error = err.message;
+  }
+  route();
+});
 
 function nodeRow(node) {
   const stats = Object.entries(node.stats)
@@ -226,6 +260,7 @@ function nodeRow(node) {
         ${node.error ? `<div class="note bad">${esc(node.error)}</div>` : ''}
         ${node.warnings.map((w) => `<div class="note">${esc(w)}</div>`).join('')}
       </div>
+      ${node.status === 'failed' ? `<button class="secondary small" data-action="retry-node" data-target="${node.id}">重试</button>` : ''}
       ${badge(node.status)}
     </li>`;
 }
@@ -242,10 +277,15 @@ function migrationBlock(m) {
       </div>
       <div class="progress"><div style="width:${percent}%"></div></div>
       <p class="facts">完成 ${m.counts.done} / ${m.counts.total}${m.counts.failed ? ` · 失败 ${m.counts.failed}` : ''}${m.counts.placeholder ? ` · 仅占位 ${m.counts.placeholder}` : ''}
-        ${root && m.status !== 'running' ? ` · <a href="${esc(root.url)}" target="_blank" rel="noreferrer">打开迁移结果</a>` : ''}</p>
+        ${root && !isActive(m.status) ? ` · <a href="${esc(root.url)}" target="_blank" rel="noreferrer">打开迁移结果</a>` : ''}</p>
       ${m.error ? `<p class="error">${esc(m.error)}</p>` : ''}
-      ${m.status === 'partial' || m.status === 'interrupted' || m.status === 'failed'
-        ? `<p class="hint"><button class="secondary" data-resume-migration="${m.id}">重试未完成的节点</button></p>` : ''}
+      <div class="actions">
+        ${m.status === 'running' ? `<button class="secondary" data-action="pause-migration" data-target="${m.id}">暂停</button>` : ''}
+        ${m.status === 'pausing' ? `<button class="secondary" disabled>暂停中…</button>
+          <span class="hint-inline">当前文档完成后暂停</span>` : ''}
+        ${m.status === 'paused' || m.status === 'interrupted' ? `<button data-action="resume-migration" data-target="${m.id}">继续</button>` : ''}
+        ${m.status === 'partial' || m.status === 'failed' ? `<button class="secondary" data-action="resume-migration" data-target="${m.id}">重试未完成的节点</button>` : ''}
+      </div>
       ${notable.map((item) => `
         <div class="tree-row">
           <div class="tree-main">

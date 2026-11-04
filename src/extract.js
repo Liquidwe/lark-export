@@ -36,11 +36,65 @@ export function startExport(sourceUrl) {
   return id;
 }
 
-// Re-reads only the nodes that did not complete, reusing the stored tree when one exists.
-export function resumeExport(id) {
-  db.prepare(`UPDATE nodes SET status = 'pending', error = NULL WHERE export_id = ? AND status = 'failed'`).run(id);
+const isActive = (status) => status === 'running' || status === 'pausing';
+
+function getExport(id) {
+  const job = db.prepare('SELECT * FROM exports WHERE id = ?').get(id);
+  if (!job) throw new Error('找不到这次读取记录');
+  return job;
+}
+
+// Continues the remaining nodes, reusing the stored tree when one exists.
+export function resumeExport(id, { retryFailed = false } = {}) {
+  if (isActive(getExport(id).status)) throw new Error('读取还在进行中，请等它停下后再继续');
+  if (retryFailed) {
+    db.prepare(`UPDATE nodes SET status = 'pending', error = NULL WHERE export_id = ? AND status = 'failed'`).run(id);
+  }
   db.prepare(`UPDATE exports SET status = 'running', error = NULL, finished_at = NULL WHERE id = ?`).run(id);
   runExport(id).catch((err) => failExport(id, err));
+}
+
+// Stops starting new nodes. Whatever is in flight finishes, then the run settles as paused.
+export function pauseExport(id) {
+  getExport(id);
+  const { changes } = db.prepare(`UPDATE exports SET status = 'pausing' WHERE id = ? AND status = 'running'`).run(id);
+  if (!changes) throw new Error('读取没有在进行中');
+}
+
+// Re-reads one failed node on its own. It can run alongside a job: a job only picks up
+// pending nodes, and this one moves straight from failed to reading.
+export function retryNode(exportId, nodeId) {
+  const job = getExport(exportId);
+  const node = db.prepare('SELECT * FROM nodes WHERE id = ? AND export_id = ?').get(nodeId, exportId);
+  if (!node) throw new Error('找不到这个文档');
+  if (node.status !== 'failed') throw new Error('只有读取失败的文档可以重试');
+  markReading(node);
+  readNodeSafely(clientFor('source', job.api_base), job, node).finally(() => settleExport(exportId));
+}
+
+function markReading(node) {
+  db.prepare(`UPDATE nodes SET status = 'reading', error = NULL WHERE id = ?`).run(node.id);
+}
+
+async function readNodeSafely(client, job, node) {
+  markReading(node);
+  try {
+    await readNode(client, job, node);
+  } catch (err) {
+    db.prepare(`UPDATE nodes SET status = 'failed', error = ? WHERE id = ?`).run(err.message, node.id);
+  }
+}
+
+// Works out a job's final status from its nodes. A single retry settles too, but must not
+// overrule a run still in progress; that run settles itself when it ends.
+function settleExport(id, { endOfRun = false } = {}) {
+  const job = getExport(id);
+  if (!endOfRun && (isActive(job.status) || !job.tree_complete)) return;
+  const count = (status) =>
+    db.prepare('SELECT COUNT(*) AS n FROM nodes WHERE export_id = ? AND status = ?').get(id, status).n;
+  let status = count('failed') ? 'partial' : 'done';
+  if (count('pending')) status = endOfRun ? 'paused' : job.status;
+  db.prepare(`UPDATE exports SET status = ?, phase = NULL, finished_at = ? WHERE id = ?`).run(status, Date.now(), id);
 }
 
 function failExport(id, err) {
@@ -67,22 +121,10 @@ async function runExport(id) {
   const pending = db
     .prepare(`SELECT * FROM nodes WHERE export_id = ? AND status = 'pending' ORDER BY position`)
     .all(id);
-  await mapConcurrent(pending, readConcurrency(), async (node) => {
-    try {
-      await readNode(client, job, node);
-    } catch (err) {
-      db.prepare(`UPDATE nodes SET status = 'failed', error = ? WHERE id = ?`).run(err.message, node.id);
-    }
+  await mapConcurrent(pending, readConcurrency(), (node) => readNodeSafely(client, job, node), {
+    shouldStop: () => getExport(id).status === 'pausing',
   });
-
-  const failed = db
-    .prepare(`SELECT COUNT(*) AS n FROM nodes WHERE export_id = ? AND status = 'failed'`)
-    .get(id).n;
-  db.prepare(`UPDATE exports SET status = ?, phase = NULL, finished_at = ? WHERE id = ?`).run(
-    failed ? 'partial' : 'done',
-    Date.now(),
-    id,
-  );
+  settleExport(id, { endOfRun: true });
 }
 
 async function readTree(client, job) {

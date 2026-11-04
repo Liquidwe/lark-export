@@ -299,12 +299,13 @@ export function pollDelay(attempt) {
 
 // Runs fn over items with at most `limit` in flight. After a failure it starts nothing new,
 // waits for what is running, then rethrows, so no work continues behind the caller's back.
-export async function mapConcurrent(items, limit, fn) {
+// shouldStop is checked before each item, and stopping that way is not an error.
+export async function mapConcurrent(items, limit, fn, { shouldStop = () => false } = {}) {
   let next = 0;
   let failed = false;
   let firstError;
   const worker = async () => {
-    while (!failed && next < items.length) {
+    while (!failed && next < items.length && !shouldStop()) {
       const item = items[next++];
       try {
         await fn(item);

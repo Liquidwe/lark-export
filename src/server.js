@@ -3,8 +3,8 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { db, parseJson } from './db.js';
-import { resumeExport, startExport } from './extract.js';
-import { resumeMigration, startMigration } from './migrate.js';
+import { pauseExport, resumeExport, retryNode, startExport } from './extract.js';
+import { pauseMigration, resumeMigration, startMigration } from './migrate.js';
 
 const PORT = Number(process.env.PORT || 4310);
 // There is no login, so anything beyond localhost is an explicit choice.
@@ -107,8 +107,23 @@ async function handleApi(req, res, path) {
     return detail ? send(res, 200, detail) : send(res, 404, { error: '记录不存在' });
   }
   if (req.method === 'POST' && (match = path.match(/^\/api\/exports\/(\d+)\/resume$/))) {
+    const { retryFailed } = await readJson(req);
+    resumeExport(Number(match[1]), { retryFailed: Boolean(retryFailed) });
+    return send(res, 200, { ok: true });
+  }
+  if (req.method === 'POST' && (match = path.match(/^\/api\/exports\/(\d+)\/pause$/))) {
     await readJson(req);
-    resumeExport(Number(match[1]));
+    pauseExport(Number(match[1]));
+    return send(res, 200, { ok: true });
+  }
+  if (req.method === 'POST' && (match = path.match(/^\/api\/exports\/(\d+)\/nodes\/(\d+)\/retry$/))) {
+    await readJson(req);
+    retryNode(Number(match[1]), Number(match[2]));
+    return send(res, 200, { ok: true });
+  }
+  if (req.method === 'POST' && (match = path.match(/^\/api\/migrations\/(\d+)\/pause$/))) {
+    await readJson(req);
+    pauseMigration(Number(match[1]));
     return send(res, 200, { ok: true });
   }
   if (req.method === 'POST' && (match = path.match(/^\/api\/exports\/(\d+)\/migrations$/))) {

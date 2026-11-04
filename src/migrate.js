@@ -12,8 +12,13 @@ const URL_TOKEN = /\/(?:wiki|docx|docs|sheets|base|bitable|file|mindnote|slides)
 export function startMigration(exportId, targetUrl) {
   const job = db.prepare('SELECT * FROM exports WHERE id = ?').get(exportId);
   if (!job) throw new Error('找不到这次读取记录');
-  if (job.status === 'running') throw new Error('读取尚未完成');
+  if (job.status === 'running' || job.status === 'pausing') throw new Error('读取尚未完成');
   if (!job.tree_complete) throw new Error('目录没有读取完整，请先重试读取');
+  // Unread nodes would otherwise be migrated as placeholders, as if their read had failed.
+  const unread = db
+    .prepare(`SELECT COUNT(*) AS n FROM nodes WHERE export_id = ? AND status IN ('pending', 'reading')`)
+    .get(exportId).n;
+  if (unread) throw new Error(`还有 ${unread} 个文档没有读取完，请先继续读取`);
   const { host, token, apiBase } = parseWikiUrl(targetUrl);
   const { lastInsertRowid } = db
     .prepare(
@@ -30,7 +35,16 @@ export function startMigration(exportId, targetUrl) {
   return id;
 }
 
+// Stops before the next node. The node in progress finishes, then the run settles as paused.
+export function pauseMigration(id) {
+  const { changes } = db.prepare(`UPDATE migrations SET status = 'pausing' WHERE id = ? AND status = 'running'`).run(id);
+  if (!changes) throw new Error('迁移没有在进行中');
+}
+
 export function resumeMigration(id) {
+  const job = db.prepare('SELECT status FROM migrations WHERE id = ?').get(id);
+  if (!job) throw new Error('找不到这次迁移记录');
+  if (job.status === 'running' || job.status === 'pausing') throw new Error('迁移还在进行中，请等它停下后再继续');
   db.prepare(`UPDATE migration_items SET error = NULL WHERE migration_id = ? AND status != 'done'`).run(id);
   db.prepare(`UPDATE migrations SET status = 'running', error = NULL, finished_at = NULL WHERE id = ?`).run(id);
   run(id);
@@ -63,7 +77,9 @@ async function runMigration(id) {
 
   // Shortcuts need their origin node to exist, so they go after every real node.
   const ordered = [...nodes.filter((n) => n.node_type !== 'shortcut'), ...nodes.filter((n) => n.node_type === 'shortcut')];
+  const isPausing = () => db.prepare('SELECT status FROM migrations WHERE id = ?').get(id).status === 'pausing';
   for (const node of ordered) {
+    if (isPausing()) break;
     const item = items.get(node.id);
     if (item.target_node_token) continue;
     try {
@@ -76,6 +92,7 @@ async function runMigration(id) {
   db.prepare(`UPDATE migrations SET phase = 'content' WHERE id = ?`).run(id);
   const linkFor = buildLinkMapper(ctx);
   for (const node of nodes) {
+    if (isPausing()) break;
     const item = db.prepare('SELECT * FROM migration_items WHERE migration_id = ? AND node_id = ?').get(id, node.id);
     if (item.status === 'done' || item.status === 'placeholder' || !item.target_node_token) continue;
     try {
@@ -85,14 +102,13 @@ async function runMigration(id) {
     }
   }
 
-  const failed = db
-    .prepare(`SELECT COUNT(*) AS n FROM migration_items WHERE migration_id = ? AND status != 'done'`)
-    .get(id).n;
-  db.prepare(`UPDATE migrations SET status = ?, phase = NULL, finished_at = ? WHERE id = ?`).run(
-    failed ? 'partial' : 'done',
-    Date.now(),
-    id,
-  );
+  const count = (statuses) =>
+    db
+      .prepare(`SELECT COUNT(*) AS n FROM migration_items WHERE migration_id = ? AND status IN (${statuses})`)
+      .get(id).n;
+  let status = count(`'pending', 'created', 'failed', 'placeholder'`) ? 'partial' : 'done';
+  if (isPausing() && count(`'pending', 'created'`)) status = 'paused';
+  db.prepare(`UPDATE migrations SET status = ?, phase = NULL, finished_at = ? WHERE id = ?`).run(status, Date.now(), id);
 }
 
 function setItem(migrationId, nodeId, fields) {
