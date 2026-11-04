@@ -1,6 +1,17 @@
 // Minimal Lark Open API client: tenant auth, throttling, retries, pagination, upload/download.
 
-const MIN_INTERVAL_MS = 220;
+const WRITE_INTERVAL_MS = 220;
+const DEFAULT_RATE_LIMIT_PAUSE_MS = 1000;
+// Reads per second, kept below the limits measured against the live API:
+// docx 6, board 10, sheets about 10, bitable 20, wiki and drive not reached at 20.
+const READ_RATES = [
+  [/^\/docx\//, 5],
+  [/^\/board\//, 8],
+  [/^\/sheets\//, 8],
+  [/^\/bitable\//, 15],
+  [/^\/wiki\//, 15],
+];
+const DEFAULT_READ_RATE = 8;
 const MAX_RETRIES = 6;
 const SINGLE_UPLOAD_LIMIT = 20 * 1024 * 1024;
 const RETRYABLE_CODES = new Set([99991400, 1254290, 1770064, 90217]);
@@ -48,11 +59,20 @@ export class LarkClient {
     this.apiBase = apiBase;
     this.cachedToken = null;
     this.tokenExpiresAt = 0;
-    this.nextSlot = 0;
+    this.pendingToken = null;
+    this.nextSlots = new Map();
   }
 
   async token() {
     if (this.cachedToken && Date.now() < this.tokenExpiresAt) return this.cachedToken;
+    // Concurrent callers share one refresh.
+    this.pendingToken ??= this.fetchToken().finally(() => {
+      this.pendingToken = null;
+    });
+    return this.pendingToken;
+  }
+
+  async fetchToken() {
     const res = await fetch(`${this.apiBase}/auth/v3/tenant_access_token/internal`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -65,11 +85,27 @@ export class LarkClient {
     return this.cachedToken;
   }
 
-  async throttle() {
+  // Requests are spaced per group, because each API family has its own limit.
+  throttleGroup(method, path) {
+    if (method !== 'GET') return { group: 'write', interval: WRITE_INTERVAL_MS };
+    const match = READ_RATES.find(([pattern]) => pattern.test(path));
+    return { group: match ? match[0].source : 'read', interval: 1000 / (match ? match[1] : DEFAULT_READ_RATE) };
+  }
+
+  async throttle(method, path) {
+    const { group, interval } = this.throttleGroup(method, path);
     const now = Date.now();
-    const wait = Math.max(0, this.nextSlot - now);
-    this.nextSlot = Math.max(now, this.nextSlot) + MIN_INTERVAL_MS;
-    if (wait) await sleep(wait);
+    const slot = Math.max(now, this.nextSlots.get(group) ?? 0);
+    this.nextSlots.set(group, slot + interval);
+    if (slot > now) await sleep(slot - now);
+  }
+
+  // Holds back the whole group, so concurrent workers stop together rather than each hitting the limit.
+  pauseGroup(method, path, res) {
+    const { group } = this.throttleGroup(method, path);
+    const seconds = Number(res.headers.get('x-ogw-ratelimit-reset'));
+    const pause = seconds > 0 ? seconds * 1000 : DEFAULT_RATE_LIMIT_PAUSE_MS;
+    this.nextSlots.set(group, Math.max(this.nextSlots.get(group) ?? 0, Date.now() + pause));
   }
 
   buildUrl(path, query) {
@@ -88,7 +124,7 @@ export class LarkClient {
     let lastError;
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
       if (attempt) await sleep(Math.min(500 * 2 ** attempt, 15000));
-      await this.throttle();
+      await this.throttle(method, path);
       const headers = { Authorization: `Bearer ${await this.token()}` };
       if (json !== undefined) headers['Content-Type'] = 'application/json; charset=utf-8';
       let res;
@@ -106,7 +142,8 @@ export class LarkClient {
       if (res.status === 429 || res.status >= 500) {
         lastError = new LarkApiError(`HTTP ${res.status}: ${path}`, { status: res.status });
         await res.body?.cancel();
-        if (res.status !== 429 && !canResend) throw lastError;
+        if (res.status === 429) this.pauseGroup(method, path, res);
+        else if (!canResend) throw lastError;
         continue;
       }
       return res;
@@ -260,12 +297,38 @@ export function pollDelay(attempt) {
   return sleep(Math.min(1000 + attempt * 500, 5000));
 }
 
+// Runs fn over items with at most `limit` in flight. After a failure it starts nothing new,
+// waits for what is running, then rethrows, so no work continues behind the caller's back.
+export async function mapConcurrent(items, limit, fn) {
+  let next = 0;
+  let failed = false;
+  let firstError;
+  const worker = async () => {
+    while (!failed && next < items.length) {
+      const item = items[next++];
+      try {
+        await fn(item);
+      } catch (err) {
+        if (!failed) firstError = err;
+        failed = true;
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  if (failed) throw firstError;
+}
+
+const clients = new Map();
+
 // Source and target bots may differ: a cross-org migration needs one app in each tenant.
+// Lark's limits are per app, so every job using the same app shares one client and its throttle.
 export function clientFor(role, apiBase) {
   const useTarget = role === 'target' && process.env.LARK_TARGET_APP_ID;
-  return new LarkClient({
-    appId: useTarget ? process.env.LARK_TARGET_APP_ID : process.env.LARK_APP_ID,
-    appSecret: useTarget ? process.env.LARK_TARGET_APP_SECRET : process.env.LARK_APP_SECRET,
-    apiBase,
-  });
+  const appId = useTarget ? process.env.LARK_TARGET_APP_ID : process.env.LARK_APP_ID;
+  const key = `${appId}|${apiBase}`;
+  if (!clients.has(key)) {
+    const appSecret = useTarget ? process.env.LARK_TARGET_APP_SECRET : process.env.LARK_APP_SECRET;
+    clients.set(key, new LarkClient({ appId, appSecret, apiBase }));
+  }
+  return clients.get(key);
 }

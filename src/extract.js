@@ -3,7 +3,16 @@
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { BLOB_DIR, db } from './db.js';
-import { clientFor, columnName, parseWikiUrl, pollDelay } from './lark.js';
+import { clientFor, columnName, mapConcurrent, parseWikiUrl, pollDelay } from './lark.js';
+
+const DEFAULT_READ_CONCURRENCY = 8;
+const MAX_READ_CONCURRENCY = 32;
+
+function readConcurrency() {
+  const value = Number.parseInt(process.env.READ_CONCURRENCY, 10);
+  if (!(value >= 1)) return DEFAULT_READ_CONCURRENCY;
+  return Math.min(value, MAX_READ_CONCURRENCY);
+}
 
 const BLOCK_IMAGE = 27;
 const BLOCK_FILE = 23;
@@ -58,13 +67,13 @@ async function runExport(id) {
   const pending = db
     .prepare(`SELECT * FROM nodes WHERE export_id = ? AND status = 'pending' ORDER BY position`)
     .all(id);
-  for (const node of pending) {
+  await mapConcurrent(pending, readConcurrency(), async (node) => {
     try {
       await readNode(client, job, node);
     } catch (err) {
       db.prepare(`UPDATE nodes SET status = 'failed', error = ? WHERE id = ?`).run(err.message, node.id);
     }
-  }
+  });
 
   const failed = db
     .prepare(`SELECT COUNT(*) AS n FROM nodes WHERE export_id = ? AND status = 'failed'`)
@@ -85,8 +94,8 @@ async function readTree(client, job) {
                         origin_node_token, title, depth, position)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   );
-  let position = 0;
-  const visit = async (node, parentToken, depth) => {
+  let discovered = 0;
+  const record = (node, parentToken, depth) =>
     insert.run(
       job.id,
       node.node_token,
@@ -97,16 +106,45 @@ async function readTree(client, job) {
       node.origin_node_token ?? null,
       node.title,
       depth,
-      position++,
+      discovered++,
     );
-    if (!node.has_child) return;
-    const children = await client.all(`/wiki/v2/spaces/${node.space_id}/nodes`, {
-      parent_node_token: node.node_token,
-      page_size: 50,
+
+  // Walked level by level so siblings can be listed in parallel. Rows go in as they are
+  // found to keep the live count moving, and get their final order once the walk is done.
+  record(root, null, 0);
+  const childrenOf = new Map();
+  let level = [root];
+  for (let depth = 1; level.length; depth++) {
+    const parents = level.filter((node) => node.has_child);
+    const next = [];
+    await mapConcurrent(parents, readConcurrency(), async (parent) => {
+      const children = await client.all(`/wiki/v2/spaces/${parent.space_id}/nodes`, {
+        parent_node_token: parent.node_token,
+        page_size: 50,
+      });
+      childrenOf.set(parent.node_token, children);
+      for (const child of children) {
+        record(child, parent.node_token, depth);
+        next.push(child);
+      }
     });
-    for (const child of children) await visit(child, node.node_token, depth + 1);
+    level = next;
+  }
+
+  const setPosition = db.prepare('UPDATE nodes SET position = ? WHERE export_id = ? AND node_token = ?');
+  let position = 0;
+  const number = (node) => {
+    setPosition.run(position++, job.id, node.node_token);
+    for (const child of childrenOf.get(node.node_token) ?? []) number(child);
   };
-  await visit(root, null, 0);
+  db.exec('BEGIN');
+  try {
+    number(root);
+    db.exec('COMMIT');
+  } catch (err) {
+    db.exec('ROLLBACK');
+    throw err;
+  }
 }
 
 async function readNode(client, job, node) {
