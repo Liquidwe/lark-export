@@ -31,11 +31,13 @@ const MAX_TEXT_LENGTH = 100000;
 const MAX_PLAIN_LINES_PER_CALL = 500;
 
 // linkFor maps a source URL or token to its migrated location; warn collects fidelity losses.
-export async function writeDocx({ client, documentId, content, assets, linkFor, warn }) {
+// progress(step, done, total) reports what is being written, for display only.
+export async function writeDocx({ client, documentId, content, assets, linkFor, warn, progress = () => {} }) {
   const byId = new Map(content.blocks.map((block) => [block.block_id, block]));
   const page = content.blocks.find((block) => block.block_type === 1);
   if (!page) return;
 
+  progress('准备文档');
   // The target doc was created by this migration, so clearing it makes a retry safe.
   const { block: targetPage } = await client.get(`/docx/v1/documents/${documentId}/blocks/${documentId}`);
   if (targetPage.children?.length) {
@@ -104,22 +106,46 @@ export async function writeDocx({ client, documentId, content, assets, linkFor, 
       }
     }
   };
-  for (const batch of batchRoots(roots, descendants)) await write(batch);
+  const batches = batchRoots(roots, descendants);
+  for (const [i, batch] of batches.entries()) {
+    progress('写入正文', i, batches.length);
+    await write(batch);
+  }
 
-  for (const upload of uploads) await applyUpload({ client, documentId, relations, upload, assets, warn });
-  for (const merge of merges) await applyMerge({ client, documentId, relations, merge, warn });
-  for (const sheet of sheets) await fillEmbeddedSheet({ client, documentId, relations, sheet, warn });
+  for (const [i, upload] of uploads.entries()) {
+    progress('上传图片和附件', i, uploads.length);
+    await applyUpload({ client, documentId, relations, upload, assets, warn });
+  }
+  for (const [i, merge] of merges.entries()) {
+    progress('合并表格单元格', i, merges.length);
+    await applyMerge({ client, documentId, relations, merge, warn });
+  }
+  for (const [i, sheet] of sheets.entries()) {
+    progress('写入内嵌电子表格', i, sheets.length);
+    await fillEmbeddedSheet({ client, documentId, relations, sheet, warn });
+  }
   const fillErrors = [];
-  for (const board of boards) {
+  for (const [i, board] of boards.entries()) {
+    progress('写入画板', i, boards.length);
     try {
       await fillBoard({ client, documentId, relations, board, assets, warn });
     } catch (err) {
       fillErrors.push(`画板: ${err.message}`);
     }
   }
-  for (const bitable of bitables) {
+  for (const [i, bitable] of bitables.entries()) {
+    const label = `内嵌多维表格 ${i + 1}/${bitables.length}`;
+    progress(label);
     try {
-      await fillEmbeddedBitable({ client, documentId, relations, bitable, assets, warn });
+      await fillEmbeddedBitable({
+        client,
+        documentId,
+        relations,
+        bitable,
+        assets,
+        warn,
+        progress: (step, done, total) => progress(`${label}：${step}`, done, total),
+      });
     } catch (err) {
       fillErrors.push(`内嵌多维表格: ${err.message}`);
     }
@@ -129,7 +155,7 @@ export async function writeDocx({ client, documentId, content, assets, linkFor, 
   }
 }
 
-async function fillEmbeddedBitable({ client, documentId, relations, bitable, assets, warn }) {
+async function fillEmbeddedBitable({ client, documentId, relations, bitable, assets, warn, progress }) {
   const blockId = relations.get(bitable.id);
   if (!blockId) return;
   const { block } = await client.get(`/docx/v1/documents/${documentId}/blocks/${blockId}`);
@@ -141,6 +167,7 @@ async function fillEmbeddedBitable({ client, documentId, relations, bitable, ass
     table: bitable.table,
     assets,
     warn,
+    progress,
   });
 }
 

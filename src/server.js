@@ -4,7 +4,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { db, parseJson } from './db.js';
 import { pauseExport, resumeExport, retryNode, startExport } from './extract.js';
-import { pauseMigration, previewMigration, resumeMigration, startMigration } from './migrate.js';
+import { migrationProgress, pauseMigration, previewMigration, resumeMigration, startMigration } from './migrate.js';
 
 const PORT = Number(process.env.PORT || 4310);
 // There is no login, so anything beyond localhost is an explicit choice.
@@ -62,7 +62,7 @@ function migrationDetail(id) {
   if (!job) return null;
   const items = db
     .prepare(
-      `SELECT i.node_id, i.status, i.error, i.warnings, i.target_node_token, n.title, n.obj_type, n.depth
+      `SELECT i.node_id, i.status, i.error, i.warnings, i.target_node_token, i.duration_ms, n.title, n.obj_type, n.depth
        FROM migration_items i JOIN nodes n ON n.id = i.node_id
        WHERE i.migration_id = ? ORDER BY n.position`,
     )
@@ -76,7 +76,7 @@ function migrationDetail(id) {
   for (const item of items) {
     if (item.status in counts) counts[item.status]++;
   }
-  return { ...job, counts, items };
+  return { ...job, counts, items, progress: migrationProgress(job, items) };
 }
 
 const send = (res, status, body) => {

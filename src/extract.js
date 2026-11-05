@@ -3,16 +3,9 @@
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { BLOB_DIR, db } from './db.js';
-import { clientFor, columnName, mapConcurrent, parseWikiUrl, pollDelay } from './lark.js';
+import { clientFor, columnName, concurrencyFromEnv, mapConcurrent, parseWikiUrl, pollDelay } from './lark.js';
 
-const DEFAULT_READ_CONCURRENCY = 8;
-const MAX_READ_CONCURRENCY = 32;
-
-function readConcurrency() {
-  const value = Number.parseInt(process.env.READ_CONCURRENCY, 10);
-  if (!(value >= 1)) return DEFAULT_READ_CONCURRENCY;
-  return Math.min(value, MAX_READ_CONCURRENCY);
-}
+const readConcurrency = () => concurrencyFromEnv('READ_CONCURRENCY', 8, 32);
 
 const BLOCK_IMAGE = 27;
 const BLOCK_FILE = 23;

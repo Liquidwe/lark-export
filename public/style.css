@@ -113,7 +113,7 @@ button:disabled { opacity: 0.5; cursor: default; }
   white-space: nowrap;
 }
 .badge.done { color: var(--ok); }
-.badge.running, .badge.created, .badge.pending, .badge.reading { color: var(--accent); background: var(--accent-soft); }
+.badge.running, .badge.created, .badge.pending, .badge.reading, .badge.writing { color: var(--accent); background: var(--accent-soft); }
 .badge.partial, .badge.unsupported, .badge.placeholder, .badge.interrupted, .badge.paused, .badge.pausing { color: var(--warn); }
 .badge.failed { color: var(--bad); }
 
@@ -152,4 +152,12 @@ button.small { flex: none; padding: 1px 10px; font-size: 12px; }
 .migration { border-top: 1px solid var(--line); padding-top: 12px; margin-top: 12px; }
 .progress { height: 6px; border-radius: 3px; background: var(--line); overflow: hidden; margin: 8px 0; }
 .progress > div { height: 100%; background: var(--accent); transition: width 0.3s; }
+.stages { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 8px 16px; margin: 8px 0; }
+.stage { color: var(--muted); font-size: 13px; }
+.stage.current { color: var(--text); font-weight: 600; }
+.stage .progress { margin: 4px 0 0; }
+.stage-count { font-variant-numeric: tabular-nums; }
+.migration h3 { font-size: 13px; font-weight: 600; margin: 12px 0 2px; }
+.duration { flex: none; color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+button.link-button { background: none; border: 0; padding: 0; margin-top: 12px; color: var(--accent); font-size: 13px; }
 .spread { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; flex-wrap: wrap; }

@@ -1,6 +1,5 @@
 // Minimal Lark Open API client: tenant auth, throttling, retries, pagination, upload/download.
 
-const WRITE_INTERVAL_MS = 220;
 const DEFAULT_RATE_LIMIT_PAUSE_MS = 1000;
 // Reads per second, kept below the limits measured against the live API:
 // docx 6, board 10, sheets about 10, bitable 20, wiki and drive not reached at 20.
@@ -12,9 +11,23 @@ const READ_RATES = [
   [/^\/wiki\//, 15],
 ];
 const DEFAULT_READ_RATE = 8;
+// Writes per second, also below what was measured: docx create 5 and patch about 3.5 (these two
+// do not share a limit), wiki create 5, uploads and board not reached at 20, bitable at least 14.
+const WRITE_RATES = [
+  [/^\/docx\/.*\/descendant$/, 4],
+  [/^\/docx\//, 3],
+  [/^\/wiki\//, 4],
+  [/^\/board\//, 15],
+  [/^\/bitable\//, 10],
+  [/^\/drive\/v1\/(medias|files)\/upload/, 15],
+];
+const DEFAULT_WRITE_RATE = 4;
 const MAX_RETRIES = 6;
 const SINGLE_UPLOAD_LIMIT = 20 * 1024 * 1024;
-const RETRYABLE_CODES = new Set([99991400, 1254290, 1770064, 90217]);
+// All of these reject the request without applying it, so resending cannot duplicate anything.
+// 131009 is a lock on the wiki tree, seen when nodes are created too quickly.
+const RATE_LIMIT_CODES = new Set([99991400, 1254290]);
+const RETRYABLE_CODES = new Set([...RATE_LIMIT_CODES, 1770064, 90217, 131009]);
 
 export class LarkApiError extends Error {
   constructor(message, { code, status, scopes, logId } = {}) {
@@ -87,9 +100,9 @@ export class LarkClient {
 
   // Requests are spaced per group, because each API family has its own limit.
   throttleGroup(method, path) {
-    if (method !== 'GET') return { group: 'write', interval: WRITE_INTERVAL_MS };
-    const match = READ_RATES.find(([pattern]) => pattern.test(path));
-    return { group: match ? match[0].source : 'read', interval: 1000 / (match ? match[1] : DEFAULT_READ_RATE) };
+    const [kind, rates, fallback] = method === 'GET' ? ['read', READ_RATES, DEFAULT_READ_RATE] : ['write', WRITE_RATES, DEFAULT_WRITE_RATE];
+    const match = rates.find(([pattern]) => pattern.test(path));
+    return { group: `${kind}:${match ? match[0].source : 'other'}`, interval: 1000 / (match ? match[1] : fallback) };
   }
 
   async throttle(method, path) {
@@ -162,7 +175,10 @@ export class LarkClient {
         throw new LarkApiError(`接口返回非 JSON (HTTP ${res.status}): ${path}`, { status: res.status });
       }
       if (payload.code === 0) return payload.data ?? {};
-      if (RETRYABLE_CODES.has(payload.code) && attempt < MAX_RETRIES) {
+      // 131001 is a generic failure that may have applied, so only its rate-limit form is resent.
+      const rateLimited = RATE_LIMIT_CODES.has(payload.code) || (payload.code === 131001 && /rate limit/i.test(payload.msg));
+      if ((rateLimited || RETRYABLE_CODES.has(payload.code)) && attempt < MAX_RETRIES) {
+        if (rateLimited) this.pauseGroup(method, path, res);
         await sleep(Math.min(1000 * 2 ** attempt, 15000));
         continue;
       }
@@ -318,6 +334,28 @@ export async function mapConcurrent(items, limit, fn, { shouldStop = () => false
   };
   await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
   if (failed) throw firstError;
+}
+
+// Runs tasks with at most `limit` in flight. Unlike mapConcurrent, tasks can be added as others finish.
+export function limiter(limit) {
+  let active = 0;
+  const waiting = [];
+  return async (task) => {
+    if (active >= limit) await new Promise((resolve) => waiting.push(resolve));
+    else active++;
+    try {
+      return await task();
+    } finally {
+      const next = waiting.shift();
+      if (next) next();
+      else active--;
+    }
+  };
+}
+
+export function concurrencyFromEnv(name, fallback, max) {
+  const value = Number.parseInt(process.env[name], 10);
+  return value >= 1 ? Math.min(value, max) : fallback;
 }
 
 const clients = new Map();

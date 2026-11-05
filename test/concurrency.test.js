@@ -144,6 +144,9 @@ test('groups are throttled separately, and writes keep their own pace', () => {
   const write = client.throttleGroup('POST', '/docx/v1/documents/x/blocks/y/descendant');
   assert.notEqual(docx.group, bitable.group);
   assert.equal(docx.interval, 200);
-  assert.equal(write.group, 'write');
-  assert.equal(write.interval, 220);
+  assert.equal(write.group, client.throttleGroup('POST', '/docx/v1/documents/z/blocks/z/descendant').group);
+  assert.notEqual(write.group, docx.group);
+  assert.notEqual(write.group, client.throttleGroup('PATCH', '/docx/v1/documents/x/blocks/y').group);
+  assert.notEqual(write.group, client.throttleGroup('POST', '/wiki/v2/spaces/s/nodes').group);
+  assert.equal(write.interval, 250);
 });

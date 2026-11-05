@@ -47,3 +47,50 @@ test('GET is resent after a 5xx', async () => {
   await client().get('/x');
   assert.equal(calls.length, 2);
 });
+
+test('a wiki lock rejection is resent, and a rate limit holds back the whole write group', async () => {
+  const client = new LarkClient({ appId: 'a', appSecret: 's', apiBase: 'https://example.test' });
+  const answers = [
+    Response.json({ code: 131009, msg: 'lock contention' }, { status: 400 }),
+    Response.json({ code: 99991400, msg: 'frequency limit' }, { status: 400, headers: { 'x-ogw-ratelimit-reset': '3' } }),
+    Response.json({ code: 0, data: { node: { node_token: 'n' } } }),
+  ];
+  let calls = 0;
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    if (String(input).endsWith('tenant_access_token/internal')) return Response.json({ code: 0, tenant_access_token: 't', expire: 7200 });
+    return answers[calls++];
+  };
+  const pauses = [];
+  const realPause = client.pauseGroup.bind(client);
+  client.pauseGroup = (...args) => {
+    pauses.push(args[1]);
+    realPause(...args);
+  };
+  try {
+    const data = await client.post('/wiki/v2/spaces/s/nodes', {});
+    assert.equal(data.node.node_token, 'n');
+    assert.equal(calls, 3);
+    assert.deepEqual(pauses, ['/wiki/v2/spaces/s/nodes'], 'only the rate limit pauses the group');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('code 131001 is resent only when it says it was rate limited', async () => {
+  const client = new LarkClient({ appId: 'a', appSecret: 's', apiBase: 'https://example.test' });
+  const answers = [
+    Response.json({ code: 131001, msg: 'rpc fail: method rate limit' }, { status: 400 }),
+    Response.json({ code: 0, data: { ok: 1 } }),
+    Response.json({ code: 131001, msg: 'rpc fail' }, { status: 400 }),
+  ];
+  let calls = 0;
+  globalThis.fetch = async (input) => {
+    if (String(input).endsWith('tenant_access_token/internal')) return Response.json({ code: 0, tenant_access_token: 't', expire: 7200 });
+    return answers[calls++];
+  };
+  assert.deepEqual(await client.post('/wiki/v2/spaces/s/nodes', {}), { ok: 1 });
+  assert.equal(calls, 2);
+  await assert.rejects(client.post('/wiki/v2/spaces/s/nodes', {}), /rpc fail/);
+  assert.equal(calls, 3);
+});

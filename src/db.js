@@ -91,6 +91,14 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_nodes_export ON nodes(export_id, position);
 `);
 
+// Volumes outlive the image, so columns added later have to be added to existing databases too.
+function addColumn(table, column, definition) {
+  const exists = db.prepare(`PRAGMA table_info(${table})`).all().some((row) => row.name === column);
+  if (!exists) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+}
+addColumn('migrations', 'active_ms', 'INTEGER NOT NULL DEFAULT 0');
+addColumn('migration_items', 'duration_ms', 'INTEGER NOT NULL DEFAULT 0');
+
 // A restart kills in-process jobs, so anything still "running" can never finish on its own.
 db.exec(`
   UPDATE exports SET status = 'interrupted' WHERE status IN ('running', 'pausing');

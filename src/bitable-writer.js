@@ -27,13 +27,24 @@ const STATIC_LABELS = {
   [FORMULA]: '公式', [LOOKUP]: '查找引用', [AUTO_NUMBER]: '自动编号',
 };
 
-export async function writeBitable({ client, appToken, content, assets, warn }) {
+export async function writeBitable({ client, appToken, content, assets, warn, progress = () => {} }) {
   const existing = await client.all(`/bitable/v1/apps/${appToken}/tables`, { page_size: 100 });
   const tableMap = new Map();
   const recordMap = new Map();
 
+  // The default table is removed last, so until then a source table of the same name would be
+  // refused (code 1254013). Default tables are commonly named just that.
+  const sourceNames = new Set(content.tables.map((table) => table.name));
+  for (const table of existing) {
+    if (sourceNames.has(table.name)) {
+      await client.patch(`/bitable/v1/apps/${appToken}/tables/${table.table_id}`, { name: `${table.name}-待删除` });
+    }
+  }
+
   // Tables must all exist before link fields can reference them, so links are added afterwards.
-  for (const table of content.tables) {
+  for (const [i, table] of content.tables.entries()) {
+    const label = `数据表 ${i + 1}/${content.tables.length}`;
+    progress(`${label}：创建字段和视图`);
     const fields = table.fields.filter((f) => !isLink(f) && f.type !== BUTTON);
     const primaryFirst = [...fields].sort((a, b) => Number(!!b.is_primary) - Number(!!a.is_primary));
     const { table_id: tableId } = await client.post(`/bitable/v1/apps/${appToken}/tables`, {
@@ -49,7 +60,15 @@ export async function writeBitable({ client, appToken, content, assets, warn }) 
       await createView(client, appToken, tableId, view, warn);
     }
 
-    const ids = await writeRecords({ client, appToken, tableId, table, assets, warn });
+    const ids = await writeRecords({
+      client,
+      appToken,
+      tableId,
+      table,
+      assets,
+      warn,
+      progress: (step, done, total) => progress(`${label}：${step}`, done, total),
+    });
     for (const [source, target] of ids) recordMap.set(source, target);
   }
 
@@ -58,6 +77,7 @@ export async function writeBitable({ client, appToken, content, assets, warn }) 
     await client.delete(`/bitable/v1/apps/${appToken}/tables/${table.table_id}`);
   }
 
+  progress('写入关联字段');
   const createdDuplex = new Set();
   for (const table of content.tables) {
     await writeLinks({ client, appToken, table, tableMap, recordMap, createdDuplex, warn });
@@ -69,7 +89,8 @@ export async function writeBitable({ client, appToken, content, assets, warn }) 
 
 // Fills the table Lark created along with an embedded bitable block. The block points at that
 // table, so unlike writeBitable it has to be reshaped in place rather than replaced.
-export async function writeEmbeddedTable({ client, appToken, tableId, table, assets, warn }) {
+export async function writeEmbeddedTable({ client, appToken, tableId, table, assets, warn, progress = () => {} }) {
+  progress('创建字段和视图');
   const base = `/bitable/v1/apps/${appToken}/tables/${tableId}`;
   const defaults = await client.all(`${base}/fields`, { page_size: 100 });
   const fields = table.fields.filter((f) => !isLink(f) && f.type !== BUTTON);
@@ -104,7 +125,8 @@ export async function writeEmbeddedTable({ client, appToken, tableId, table, ass
   for (const view of otherViews) await createView(client, appToken, tableId, view, warn);
   if (table.views.length) warn('视图只迁移了名称和类型，筛选、排序、分组条件需要重新设置');
 
-  const recordMap = await writeRecords({ client, appToken, tableId, table, assets, warn });
+  const recordMap = await writeRecords({ client, appToken, tableId, table, assets, warn, progress });
+  progress('写入关联字段');
   await writeLinks({
     client,
     appToken,
@@ -153,14 +175,15 @@ async function createView(client, appToken, tableId, view, warn) {
   }
 }
 
-async function writeRecords({ client, appToken, tableId, table, assets, warn }) {
+async function writeRecords({ client, appToken, tableId, table, assets, warn, progress }) {
   const fields = table.fields.filter((f) => !isLink(f) && f.type !== BUTTON);
   const mapping = new Map();
   const uploaded = new Map();
   const base = `/bitable/v1/apps/${appToken}/tables/${tableId}`;
 
   const rows = [];
-  for (const record of table.records) {
+  for (const [index, record] of table.records.entries()) {
+    progress('处理记录和附件', index, table.records.length);
     const values = {};
     for (const field of fields) {
       const raw = record.fields[field.field_name];
@@ -172,6 +195,7 @@ async function writeRecords({ client, appToken, tableId, table, assets, warn }) 
   }
 
   for (let i = 0; i < rows.length; i += RECORD_BATCH) {
+    progress('写入记录', i, rows.length);
     const batch = rows.slice(i, i + RECORD_BATCH);
     const { records } = await client.post(
       `${base}/records/batch_create`,

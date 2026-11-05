@@ -3,11 +3,17 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { BLOB_DIR, db, parseJson } from './db.js';
-import { clientFor, parseWikiUrl, pollDelay } from './lark.js';
+import { clientFor, concurrencyFromEnv, limiter, mapConcurrent, parseWikiUrl, pollDelay } from './lark.js';
 import { writeBitable } from './bitable-writer.js';
 import { writeDocx } from './docx-writer.js';
 
 const URL_TOKEN = /\/(?:wiki|docx|docs|sheets|base|bitable|file|mindnote|slides)\/([A-Za-z0-9]+)/;
+const TITLE_ATTEMPTS = 5;
+const TITLE_SETTLE_MS = 2000;
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const writeConcurrency = () => concurrencyFromEnv('WRITE_CONCURRENCY', 6, 16);
+// What each running migration is doing right now. Only for display, so it need not survive a restart.
+const live = new Map();
 
 export function startMigration(exportId, targetUrl) {
   const job = db.prepare('SELECT * FROM exports WHERE id = ?').get(exportId);
@@ -84,19 +90,107 @@ export function resumeMigration(id) {
   const job = db.prepare('SELECT status FROM migrations WHERE id = ?').get(id);
   if (!job) throw new Error('找不到这次迁移记录');
   if (job.status === 'running' || job.status === 'pausing') throw new Error('迁移还在进行中，请等它停下后再继续');
+  // Failed nodes go back in line, so while waiting they neither show as failed nor count as finished.
+  db.prepare(
+    `UPDATE migration_items SET status = CASE WHEN target_node_token IS NULL THEN 'pending' ELSE 'created' END
+     WHERE migration_id = ? AND status = 'failed'`,
+  ).run(id);
   db.prepare(`UPDATE migration_items SET error = NULL WHERE migration_id = ? AND status != 'done'`).run(id);
   db.prepare(`UPDATE migrations SET status = 'running', error = NULL, finished_at = NULL WHERE id = ?`).run(id);
   run(id);
 }
 
 function run(id) {
-  runMigration(id).catch((err) => {
-    db.prepare(`UPDATE migrations SET status = 'failed', error = ?, finished_at = ? WHERE id = ?`).run(
-      err.message,
-      Date.now(),
-      id,
-    );
+  const startedAt = Date.now();
+  live.set(id, { startedAt, phaseStartedAt: startedAt, phaseBaseline: 0, active: new Map(), concurrency: writeConcurrency() });
+  runMigration(id)
+    .catch((err) => {
+      db.prepare(`UPDATE migrations SET status = 'failed', error = ?, finished_at = ? WHERE id = ?`).run(
+        err.message,
+        Date.now(),
+        id,
+      );
+    })
+    .finally(() => {
+      db.prepare('UPDATE migrations SET active_ms = active_ms + ? WHERE id = ?').run(Date.now() - startedAt, id);
+      live.delete(id);
+    });
+}
+
+const structureDone = (items) => items.filter((item) => item.target_node_token || item.status === 'failed').length;
+const contentDone = (items) => items.filter((item) => ['done', 'placeholder', 'failed'].includes(item.status)).length;
+
+function enterPhase(id, phase) {
+  db.prepare('UPDATE migrations SET phase = ? WHERE id = ?').run(phase, id);
+  const items = db.prepare('SELECT target_node_token, status FROM migration_items WHERE migration_id = ?').all(id);
+  Object.assign(live.get(id), {
+    phaseStartedAt: Date.now(),
+    phaseBaseline: phase === 'content' ? contentDone(items) : structureDone(items),
   });
+}
+
+// Reports one node's work as live, and adds the time it took to that node.
+async function track(ctx, node, step, work) {
+  const state = live.get(ctx.job.id);
+  const entry = { step, done: null, total: null, startedAt: Date.now() };
+  state.active.set(node.id, entry);
+  try {
+    return await work((nextStep, done = null, total = null) => Object.assign(entry, { step: nextStep, done, total }));
+  } finally {
+    state.active.delete(node.id);
+    db.prepare('UPDATE migration_items SET duration_ms = duration_ms + ? WHERE migration_id = ? AND node_id = ?').run(
+      Date.now() - entry.startedAt,
+      ctx.job.id,
+      node.id,
+    );
+  }
+}
+
+// Everything the page shows about a migration's progress. items come from the caller's query.
+export function migrationProgress(job, items) {
+  const state = live.get(job.id);
+  const now = Date.now();
+  const titles = new Map(items.map((item) => [item.node_id, item]));
+  const byType = {};
+  for (const item of items) {
+    byType[item.obj_type] ??= { total: 0, done: 0 };
+    byType[item.obj_type].total++;
+    if (['done', 'placeholder', 'failed'].includes(item.status)) byType[item.obj_type].done++;
+  }
+  const structure = structureDone(items);
+  const content = contentDone(items);
+  const result = {
+    structure,
+    content,
+    byType,
+    elapsedMs: job.active_ms + (state ? now - state.startedAt : 0),
+    active: [],
+    ratePerSecond: null,
+    etaMs: null,
+    concurrency: null,
+  };
+  if (!state) return result;
+  result.concurrency = state.concurrency;
+  result.active = [...state.active]
+    .sort((a, b) => a[1].startedAt - b[1].startedAt)
+    .map(([nodeId, entry]) => ({
+      nodeId,
+      title: titles.get(nodeId)?.title,
+      objType: titles.get(nodeId)?.obj_type,
+      step: entry.step,
+      done: entry.done,
+      total: entry.total,
+      ms: now - entry.startedAt,
+    }));
+  const current = job.phase === 'content' ? content : structure;
+  const finished = current - state.phaseBaseline;
+  // A few nodes are too few to extrapolate from, since documents differ widely in size.
+  if (finished >= 3) {
+    const rate = finished / (now - state.phaseStartedAt);
+    result.ratePerSecond = rate * 1000;
+    result.etaMs = (items.length - current) / rate;
+  }
+  return result;
 }
 
 async function runMigration(id) {
@@ -114,32 +208,31 @@ async function runMigration(id) {
   const assets = loadAssets(job.export_id);
   const ctx = { client, job, source, target, spaceId: target.space_id, rootToken: target.node_token, nodes, items, assets };
 
-  // Shortcuts need their origin node to exist, so they go after every real node.
-  const ordered = [...nodes.filter((n) => n.node_type !== 'shortcut'), ...nodes.filter((n) => n.node_type === 'shortcut')];
   const isPausing = () => db.prepare('SELECT status FROM migrations WHERE id = ?').get(id).status === 'pausing';
-  for (const node of ordered) {
-    if (isPausing()) break;
-    const item = items.get(node.id);
-    if (item.target_node_token) continue;
-    try {
-      await createNode(ctx, node, item);
-    } catch (err) {
-      setItem(id, node.id, { status: 'failed', error: err.message });
-    }
-  }
+  const concurrency = live.get(id).concurrency;
 
-  db.prepare(`UPDATE migrations SET phase = 'content' WHERE id = ?`).run(id);
+  enterPhase(id, 'structure');
+  await createStructure(ctx, concurrency, isPausing);
+
+  enterPhase(id, 'content');
   const linkFor = buildLinkMapper(ctx);
-  for (const node of nodes) {
-    if (isPausing()) break;
-    const item = db.prepare('SELECT * FROM migration_items WHERE migration_id = ? AND node_id = ?').get(id, node.id);
-    if (item.status === 'done' || item.status === 'placeholder' || !item.target_node_token) continue;
-    try {
-      await fillNode(ctx, node, item, linkFor);
-    } catch (err) {
-      setItem(id, node.id, { status: 'failed', error: err.message });
-    }
-  }
+  // Documents are independent once their nodes exist. Each is still written by one worker,
+  // because its blocks are positioned by index.
+  await mapConcurrent(
+    nodes,
+    concurrency,
+    async (node) => {
+      const item = db.prepare('SELECT * FROM migration_items WHERE migration_id = ? AND node_id = ?').get(id, node.id);
+      if (item.status === 'done' || item.status === 'placeholder' || !item.target_node_token) return;
+      try {
+        await track(ctx, node, '等待写入', (progress) => fillNode(ctx, node, item, linkFor, progress));
+      } catch (err) {
+        setItem(id, node.id, { status: 'failed', error: err.message });
+      }
+    },
+    { shouldStop: isPausing },
+  );
+  await confirmRootTitle(ctx);
 
   const count = (statuses) =>
     db
@@ -148,6 +241,76 @@ async function runMigration(id) {
   let status = count(`'pending', 'created', 'failed', 'placeholder'`) ? 'partial' : 'done';
   if (isPausing() && count(`'pending', 'created'`)) status = 'paused';
   db.prepare(`UPDATE migrations SET status = ?, phase = NULL, finished_at = ? WHERE id = ?`).run(status, Date.now(), id);
+}
+
+// A wiki node joins the end of its parent's children, so siblings are created one at a time
+// to keep their order. Separate parents can run side by side.
+async function createStructure(ctx, concurrency, isPausing) {
+  const slot = limiter(concurrency);
+  const reached = new Set();
+  const create = async (node) => {
+    const item = ctx.items.get(node.id);
+    if (item.target_node_token) return;
+    try {
+      await track(ctx, node, createStep(node), () => createNode(ctx, node, item));
+    } catch (err) {
+      setItem(ctx.job.id, node.id, { status: 'failed', error: err.message });
+    }
+  };
+
+  const real = ctx.nodes.filter((node) => node.node_type !== 'shortcut');
+  const children = Map.groupBy(real, (node) => node.parent_token);
+  const walk = async (parentToken) => {
+    const branches = [];
+    for (const node of children.get(parentToken) ?? []) {
+      if (isPausing()) break;
+      reached.add(node.id);
+      await slot(async () => {
+        if (!isPausing()) await create(node);
+      });
+      branches.push(walk(node.node_token));
+    }
+    await Promise.all(branches);
+  };
+  await walk(null);
+
+  // Shortcuts need their origin node to exist, so they go after every real node,
+  // along with anything that hangs below a shortcut rather than a real node.
+  for (const node of [...real, ...ctx.nodes.filter((n) => n.node_type === 'shortcut')]) {
+    if (isPausing()) break;
+    if (!reached.has(node.id)) await create(node);
+  }
+}
+
+// Lark sometimes answers a rename with success, updates the document's page block, and leaves the
+// wiki title behind (6 of 30 on the live API). Sending the same title again then does nothing
+// (0 of 3 fixed), because it matches the page block; going through another title does (6 of 6).
+// So the title is read back once nothing else is writing to the document.
+async function confirmRootTitle(ctx) {
+  const root = ctx.nodes.find((node) => node.parent_token === null);
+  if (ctx.items.get(root?.id)?.target_node_token !== ctx.rootToken) return;
+  for (let attempt = 0; attempt < TITLE_ATTEMPTS; attempt++) {
+    const { node } = await ctx.client.get('/wiki/v2/spaces/get_node', { token: ctx.rootToken });
+    if (node.title === root.title) return;
+    const rename = `/wiki/v2/spaces/${ctx.spaceId}/nodes/${ctx.rootToken}/update_title`;
+    await ctx.client.post(rename, { title: `${root.title}…` });
+    await ctx.client.post(rename, { title: root.title });
+    await sleep(TITLE_SETTLE_MS);
+  }
+  const { node } = await ctx.client.get('/wiki/v2/spaces/get_node', { token: ctx.rootToken });
+  if (node.title === root.title) return;
+  const { warnings } = db
+    .prepare('SELECT warnings FROM migration_items WHERE migration_id = ? AND node_id = ?')
+    .get(ctx.job.id, root.id);
+  setItem(ctx.job.id, root.id, {
+    warnings: JSON.stringify([...parseJson(warnings, []), `目标文档没能改名为「${root.title}」，请在 Lark 中手动修改标题`]),
+  });
+}
+
+function createStep(node) {
+  if (node.status === 'done' && node.obj_type === 'sheet') return '导入电子表格';
+  if (node.status === 'done' && node.obj_type === 'file') return '上传文件';
+  return '新建节点';
 }
 
 function setItem(migrationId, nodeId, fields) {
@@ -322,7 +485,7 @@ function buildLinkMapper(ctx) {
   };
 }
 
-async function fillNode(ctx, node, item, linkFor) {
+async function fillNode(ctx, node, item, linkFor, progress) {
   const warnings = new Set();
   const warn = (message) => warnings.add(message);
   const assets = ctx.assets.get(node.id) ?? new Map();
@@ -347,10 +510,12 @@ async function fillNode(ctx, node, item, linkFor) {
       assets,
       linkFor,
       warn,
+      progress,
     });
   } else if (node.status === 'done' && node.obj_type === 'bitable') {
-    await writeBitable({ client: ctx.client, appToken: item.target_obj_token, content, assets, warn });
+    await writeBitable({ client: ctx.client, appToken: item.target_obj_token, content, assets, warn, progress });
   } else if (node.status !== 'done') {
+    progress('写入占位文档');
     const url = `${ctx.source.host}/wiki/${node.node_token}`;
     const reason = node.status === 'unsupported' ? `暂不支持迁移 ${node.obj_type} 类型` : `读取失败: ${node.error}`;
     await writePlaceholder(ctx, item, `${reason}。原始文档: ${url}`);

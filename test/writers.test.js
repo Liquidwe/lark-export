@@ -420,3 +420,20 @@ test('docx: a rejected table falls back to one line per row', async () => {
   const lines = client.accepted.flatMap((c) => c.blocks).map((b) => b.text.elements[0].text_run.content);
   assert.deepEqual(lines, ['c0 | c1', 'c2 | c3']);
 });
+
+test('bitable: a source table named like the default table is not refused as a duplicate', async () => {
+  const calls = [];
+  const client = {
+    all: async () => [{ table_id: 'default', name: '数据表' }],
+    patch: async (path, body) => calls.push(['patch', path, body.name]),
+    post: async (path) => {
+      calls.push(['post', path]);
+      return path.endsWith('/tables') ? { table_id: 'new' } : { records: [] };
+    },
+    delete: async (path) => calls.push(['delete', path]),
+  };
+  const content = { tables: [{ table_id: 't', name: '数据表', fields: [], views: [], records: [] }] };
+  await writeBitable({ client, appToken: 'app', content, assets: new Map(), warn: () => {} });
+  const steps = calls.map(([kind, path]) => `${kind} ${path.split('/').at(-1)}`);
+  assert.deepEqual(steps, ['patch default', 'post tables', 'delete default']);
+});

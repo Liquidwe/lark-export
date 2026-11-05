@@ -3,6 +3,8 @@ const POLL_MS = 1500;
 let pollTimer = null;
 // Re-renders replace the DOM, so typed input and errors live here to survive polling.
 const draft = { source: '', target: '', error: '' };
+// Migrations whose full node list is open. Kept here for the same reason.
+const openNodeLists = new Set();
 
 const TYPE_LABELS = {
   docx: '文档',
@@ -24,6 +26,7 @@ const STATUS_LABELS = {
   partial: '部分失败',
   failed: '失败',
   placeholder: '仅占位',
+  writing: '处理中',
   interrupted: '已中断',
   unsupported: '不支持',
 };
@@ -53,6 +56,14 @@ function formatBytes(bytes) {
   if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(1)} KB`;
   if (bytes < 1024 ** 3) return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
   return `${(bytes / 1024 ** 3).toFixed(2)} GB`;
+}
+
+function formatDuration(ms) {
+  const seconds = Math.round(ms / 1000);
+  if (seconds < 60) return `${seconds} 秒`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes} 分 ${seconds % 60} 秒`;
+  return `${Math.floor(minutes / 60)} 小时 ${minutes % 60} 分`;
 }
 
 async function api(path, body) {
@@ -231,6 +242,9 @@ const ACTIONS = {
   'retry-node': ({ exportId, target }) => api(`/api/exports/${exportId}/nodes/${target}/retry`, {}),
   'pause-migration': ({ target }) => api(`/api/migrations/${target}/pause`, {}),
   'resume-migration': ({ target }) => api(`/api/migrations/${target}/resume`, {}),
+  'toggle-nodes': ({ target }) => {
+    if (!openNodeLists.delete(target)) openNodeLists.add(target);
+  },
 };
 
 app.addEventListener('click', async (event) => {
@@ -282,8 +296,76 @@ function nodeRow(node) {
     </li>`;
 }
 
+function stage(number, label, done, total, state) {
+  const percent = total ? Math.round((done / total) * 100) : 0;
+  return `
+    <div class="stage ${state}">
+      <div class="spread"><span>${number}. ${label}</span><span class="stage-count">${done} / ${total}</span></div>
+      <div class="progress"><div style="width:${percent}%"></div></div>
+    </div>`;
+}
+
+function stages(m) {
+  const { structure, content } = m.progress;
+  const running = isActive(m.status);
+  return `
+    <div class="stages">
+      ${stage(1, '建目录', structure, m.counts.total, running && m.phase === 'structure' ? 'current' : '')}
+      ${stage(2, '写内容', content, m.counts.total, running && m.phase === 'content' ? 'current' : '')}
+    </div>`;
+}
+
+function progressFacts(m) {
+  const { elapsedMs, ratePerSecond, etaMs, concurrency, byType } = m.progress;
+  const facts = [`用时 ${formatDuration(elapsedMs)}`];
+  if (isActive(m.status) && etaMs !== null) {
+    facts.push(`当前阶段还需约 ${formatDuration(etaMs)}`, `${ratePerSecond.toFixed(1)} 个/秒`);
+  }
+  if (isActive(m.status)) facts.push(`并发 ${concurrency}`);
+  const types = Object.entries(byType).map(([type, { done, total }]) => `${typeLabel(type)} ${done}/${total}`);
+  return `<p class="facts">${esc(facts.join(' · '))}</p><p class="facts">${esc(types.join(' · '))}</p>`;
+}
+
+const stepText = ({ step, done, total }) => (total ? `${step} ${done}/${total}` : step);
+
+function activeList(m) {
+  const { active } = m.progress;
+  if (!active.length) return '';
+  return `
+    <h3>正在处理 (${active.length})</h3>
+    ${active.map((entry) => `
+      <div class="tree-row">
+        <div class="tree-main">
+          <span class="tree-title">${esc(entry.title || '未命名')}</span>
+          <span class="tree-type">${esc(typeLabel(entry.objType))}</span>
+          <div class="tree-stats">${esc(stepText(entry))}</div>
+        </div>
+        <span class="duration">${esc(formatDuration(entry.ms))}</span>
+      </div>`).join('')}`;
+}
+
+function nodeList(m) {
+  const open = openNodeLists.has(String(m.id));
+  const active = new Map(m.progress.active.map((entry) => [entry.nodeId, entry]));
+  const rows = !open ? '' : m.items.map((item) => {
+    const current = active.get(item.node_id);
+    return `
+      <div class="tree-row" style="padding-left:${item.depth * 20}px">
+        <div class="tree-main">
+          <span class="tree-title">${item.url ? `<a href="${esc(item.url)}" target="_blank" rel="noreferrer">${esc(item.title)}</a>` : esc(item.title)}</span>
+          <span class="tree-type">${esc(typeLabel(item.obj_type))}</span>
+          ${current ? `<div class="tree-stats">${esc(stepText(current))}</div>` : ''}
+        </div>
+        ${item.duration_ms ? `<span class="duration">${esc(formatDuration(item.duration_ms))}</span>` : ''}
+        ${badge(current ? 'writing' : item.status)}
+      </div>`;
+  }).join('');
+  return `
+    <button class="link-button" data-action="toggle-nodes" data-target="${m.id}">${open ? '收起节点列表' : `查看全部节点 (${m.counts.total})`}</button>
+    ${rows}`;
+}
+
 function migrationBlock(m) {
-  const percent = m.counts.total ? Math.round((m.counts.done / m.counts.total) * 100) : 0;
   const notable = m.items.filter((item) => item.status === 'failed' || item.status === 'placeholder' || item.warnings.length);
   const root = m.items.find((item) => item.url);
   return `
@@ -292,14 +374,15 @@ function migrationBlock(m) {
         <div class="job-meta">迁移 #${m.id} → <a href="${esc(m.target_url)}" target="_blank" rel="noreferrer">${esc(m.target_url)}</a></div>
         ${badge(m.status)}
       </div>
-      <div class="progress"><div style="width:${percent}%"></div></div>
+      ${stages(m)}
+      ${progressFacts(m)}
       <p class="facts">完成 ${m.counts.done} / ${m.counts.total}${m.counts.failed ? ` · 失败 ${m.counts.failed}` : ''}${m.counts.placeholder ? ` · 仅占位 ${m.counts.placeholder}` : ''}
         ${root && !isActive(m.status) ? ` · <a href="${esc(root.url)}" target="_blank" rel="noreferrer">打开迁移结果</a>` : ''}</p>
       ${m.error ? `<p class="error">${esc(m.error)}</p>` : ''}
       <div class="actions">
         ${m.status === 'running' ? `<button class="secondary" data-action="pause-migration" data-target="${m.id}">暂停</button>` : ''}
         ${m.status === 'pausing' ? `<button class="secondary" disabled>暂停中…</button>
-          <span class="hint-inline">当前文档完成后暂停</span>` : ''}
+          <span class="hint-inline">正在处理的文档完成后暂停</span>` : ''}
         ${m.status === 'paused' || m.status === 'interrupted' ? `<button data-action="resume-migration" data-target="${m.id}">继续</button>` : ''}
         ${m.status === 'partial' || m.status === 'failed' ? `<button class="secondary" data-action="resume-migration" data-target="${m.id}">重试未完成的节点</button>` : ''}
       </div>
@@ -312,6 +395,8 @@ function migrationBlock(m) {
           </div>
           ${badge(item.status)}
         </div>`).join('')}
+      ${activeList(m)}
+      ${nodeList(m)}
     </div>`;
 }
 
