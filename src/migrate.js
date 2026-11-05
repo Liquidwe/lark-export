@@ -2,12 +2,14 @@
 
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { clientForJob } from './auth.js';
 import { BLOB_DIR, db, parseJson } from './db.js';
-import { clientFor, concurrencyFromEnv, limiter, mapConcurrent, parseWikiUrl, pollDelay } from './lark.js';
+import { appConfig, clientFor, concurrencyFromEnv, documentHost, limiter, mapConcurrent, parseWikiUrl, pollDelay } from './lark.js';
 import { writeBitable } from './bitable-writer.js';
 import { writeDocx } from './docx-writer.js';
 
 const URL_TOKEN = /\/(?:wiki|docx|docs|sheets|base|bitable|file|mindnote|slides)\/([A-Za-z0-9]+)/;
+const MY_LIBRARY = 'my_library';
 const TITLE_ATTEMPTS = 5;
 const TITLE_SETTLE_MS = 2000;
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -15,7 +17,7 @@ const writeConcurrency = () => concurrencyFromEnv('WRITE_CONCURRENCY', 6, 16);
 // What each running migration is doing right now. Only for display, so it need not survive a restart.
 const live = new Map();
 
-export function startMigration(exportId, targetUrl) {
+function assertReadFinished(exportId) {
   const job = db.prepare('SELECT * FROM exports WHERE id = ?').get(exportId);
   if (!job) throw new Error('找不到这次读取记录');
   if (job.status === 'running' || job.status === 'pausing') throw new Error('读取尚未完成');
@@ -25,14 +27,33 @@ export function startMigration(exportId, targetUrl) {
     .prepare(`SELECT COUNT(*) AS n FROM nodes WHERE export_id = ? AND status IN ('pending', 'reading')`)
     .get(exportId).n;
   if (unread) throw new Error(`还有 ${unread} 个文档没有读取完，请先继续读取`);
+}
+
+export function startMigration(exportId, targetUrl) {
+  assertReadFinished(exportId);
   const { host, token, apiBase } = parseWikiUrl(targetUrl);
   assertTargetOutsideSource(exportId, token);
+  return createMigration(exportId, targetUrl.trim(), host, apiBase, token);
+}
+
+// Writes a member's read to their own library in the new organization, as top-level nodes.
+export function startLibraryMigration(exportId) {
+  assertReadFinished(exportId);
+  const busy = db
+    .prepare(`SELECT id FROM migrations WHERE export_id = ? AND status IN ('running', 'pausing') LIMIT 1`)
+    .get(exportId);
+  if (busy) throw new Error('迁移正在进行中');
+  const { apiBase, host } = appConfig('target');
+  return createMigration(exportId, '', host, apiBase, MY_LIBRARY);
+}
+
+function createMigration(exportId, targetUrl, host, apiBase, token) {
   const { lastInsertRowid } = db
     .prepare(
       `INSERT INTO migrations (export_id, target_url, target_host, api_base, target_token, phase, created_at)
        VALUES (?, ?, ?, ?, ?, 'structure', ?)`,
     )
-    .run(exportId, targetUrl.trim(), host, apiBase, token, Date.now());
+    .run(exportId, targetUrl, host, apiBase, token, Date.now());
   const id = Number(lastInsertRowid);
   const insert = db.prepare('INSERT INTO migration_items (migration_id, node_id) VALUES (?, ?)');
   for (const { id: nodeId } of db.prepare('SELECT id FROM nodes WHERE export_id = ?').all(exportId)) {
@@ -51,7 +72,7 @@ function assertTargetOutsideSource(exportId, token) {
 // The target takes on the source root's title and body, and children go directly under it.
 // That only works doc to doc: a wiki node cannot change type.
 function rootBecomesTarget(root, target) {
-  return root.status === 'done' && root.obj_type === 'docx' && root.node_type !== 'shortcut' && target.obj_type === 'docx';
+  return root.status === 'done' && root.obj_type === 'docx' && root.node_type !== 'shortcut' && target?.obj_type === 'docx';
 }
 
 // Describes what a migration would do to the target, so it can be confirmed before anything is overwritten.
@@ -196,17 +217,20 @@ export function migrationProgress(job, items) {
 async function runMigration(id) {
   const job = db.prepare('SELECT * FROM migrations WHERE id = ?').get(id);
   const source = db.prepare('SELECT * FROM exports WHERE id = ?').get(job.export_id);
-  const client = clientFor('target', job.api_base);
+  const client = clientForJob('target', { owner_id: source.owner_id, api_base: job.api_base });
 
-  const { node: target } = await client.get('/wiki/v2/spaces/get_node', { token: job.target_token });
-  db.prepare('UPDATE migrations SET space_id = ? WHERE id = ?').run(target.space_id, id);
+  // A library has no node to merge into, so its target and root token stay empty.
+  const toLibrary = job.target_token === MY_LIBRARY;
+  const target = toLibrary ? null : (await client.get('/wiki/v2/spaces/get_node', { token: job.target_token })).node;
+  const spaceId = toLibrary ? (await client.get(`/wiki/v2/spaces/${MY_LIBRARY}`)).space.space_id : target.space_id;
+  db.prepare('UPDATE migrations SET space_id = ? WHERE id = ?').run(spaceId, id);
 
   const nodes = db.prepare('SELECT * FROM nodes WHERE export_id = ? ORDER BY position').all(job.export_id);
   const items = new Map(
     db.prepare('SELECT * FROM migration_items WHERE migration_id = ?').all(id).map((item) => [item.node_id, item]),
   );
   const assets = loadAssets(job.export_id);
-  const ctx = { client, job, source, target, spaceId: target.space_id, rootToken: target.node_token, nodes, items, assets };
+  const ctx = { client, job, source, target, spaceId, rootToken: target?.node_token ?? null, nodes, items, assets };
 
   const isPausing = () => db.prepare('SELECT status FROM migrations WHERE id = ?').get(id).status === 'pausing';
   const concurrency = live.get(id).concurrency;
@@ -215,6 +239,7 @@ async function runMigration(id) {
   await createStructure(ctx, concurrency, isPausing);
 
   enterPhase(id, 'content');
+  if (toLibrary) await learnTargetHost(ctx);
   const linkFor = buildLinkMapper(ctx);
   // Documents are independent once their nodes exist. Each is still written by one worker,
   // because its blocks are positioned by index.
@@ -245,6 +270,18 @@ async function runMigration(id) {
 
 // A wiki node joins the end of its parent's children, so siblings are created one at a time
 // to keep their order. Separate parents can run side by side.
+async function learnTargetHost(ctx) {
+  const row = db
+    .prepare(
+      `SELECT target_obj_token AS obj_token, target_obj_type AS obj_type FROM migration_items
+       WHERE migration_id = ? AND target_obj_token IS NOT NULL LIMIT 1`,
+    )
+    .get(ctx.job.id);
+  if (!row) return;
+  ctx.job.target_host = await documentHost(ctx.client, row, ctx.job.target_host);
+  db.prepare('UPDATE migrations SET target_host = ? WHERE id = ?').run(ctx.job.target_host, ctx.job.id);
+}
+
 async function createStructure(ctx, concurrency, isPausing) {
   const slot = limiter(concurrency);
   const reached = new Set();
@@ -287,6 +324,7 @@ async function createStructure(ctx, concurrency, isPausing) {
 // (0 of 3 fixed), because it matches the page block; going through another title does (6 of 6).
 // So the title is read back once nothing else is writing to the document.
 async function confirmRootTitle(ctx) {
+  if (!ctx.rootToken) return;
   const root = ctx.nodes.find((node) => node.parent_token === null);
   if (ctx.items.get(root?.id)?.target_node_token !== ctx.rootToken) return;
   for (let attempt = 0; attempt < TITLE_ATTEMPTS; attempt++) {
@@ -331,7 +369,8 @@ function loadAssets(exportId) {
 }
 
 function parentOf(ctx, node) {
-  if (node.parent_token === null) return ctx.rootToken;
+  // Null for a library, where leaving the parent out places a node at the top level.
+  if (node.parent_token === null) return ctx.rootToken ?? undefined;
   const parent = ctx.nodes.find((n) => n.node_token === node.parent_token);
   const parentItem = db
     .prepare('SELECT target_node_token FROM migration_items WHERE migration_id = ? AND node_id = ?')
@@ -491,7 +530,7 @@ async function fillNode(ctx, node, item, linkFor, progress) {
   const assets = ctx.assets.get(node.id) ?? new Map();
   const content = parseJson(node.content);
   let finalStatus = 'done';
-  if (node.parent_token === null && item.target_node_token !== ctx.rootToken) {
+  if (ctx.rootToken && node.parent_token === null && item.target_node_token !== ctx.rootToken) {
     warn(`源文档是${node.obj_type}类型，无法合并到目标文档，已放在目标节点下面`);
   }
 

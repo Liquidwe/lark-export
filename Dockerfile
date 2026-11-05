@@ -18,6 +18,6 @@ EXPOSE 4310
 VOLUME ["/app/data"]
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
-  CMD node -e "fetch('http://127.0.0.1:' + process.env.PORT + '/api/exports').then((r) => process.exit(r.ok ? 0 : 1), () => process.exit(1))"
+  CMD node -e "fetch('http://127.0.0.1:' + process.env.PORT + '/api/health').then((r) => process.exit(r.ok ? 0 : 1), () => process.exit(1))"
 
 CMD ["node", "--disable-warning=ExperimentalWarning", "src/server.js"]

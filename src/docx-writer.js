@@ -233,9 +233,10 @@ async function fillBoard({ client, documentId, relations, board, assets, warn })
   // Lark rejects user IDs from another tenant, and one bad node fails the whole board.
   const stickies = nodes.filter((node) => node.sticky_note);
   if (stickies.length) {
-    const info = await (await client.send('GET', '/bot/v3/info')).json();
+    // A member's client acts as that member, who is not the bot and cannot ask for the bot's info.
+    const author = client.openId ?? (await (await client.send('GET', '/bot/v3/info')).json()).bot.open_id;
     for (const node of stickies) {
-      node.sticky_note.user_id = info.bot.open_id;
+      node.sticky_note.user_id = author;
       node.sticky_note.show_author_info = false;
     }
     warn('画板便签的作者无法跨组织保留，已隐藏作者信息');

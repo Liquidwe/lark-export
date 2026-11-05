@@ -1,9 +1,10 @@
 // Reads a wiki subtree into the local database and blob directory.
 
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { clientForJob } from './auth.js';
 import { BLOB_DIR, db } from './db.js';
-import { clientFor, columnName, concurrencyFromEnv, mapConcurrent, parseWikiUrl, pollDelay } from './lark.js';
+import { appConfig, columnName, concurrencyFromEnv, documentHost, mapConcurrent, parseWikiUrl, pollDelay } from './lark.js';
 
 const readConcurrency = () => concurrencyFromEnv('READ_CONCURRENCY', 8, 32);
 
@@ -16,6 +17,7 @@ const BITABLE_ATTACHMENT = 17;
 // One past the writer's 100x100 limit, so the writer can tell when it truncated.
 const MAX_EMBED_ROWS = 101;
 const MAX_EMBED_COLUMNS = 101;
+const MY_LIBRARY = 'my_library';
 
 export function startExport(sourceUrl) {
   const { host, token, apiBase } = parseWikiUrl(sourceUrl);
@@ -28,6 +30,36 @@ export function startExport(sourceUrl) {
   const id = Number(lastInsertRowid);
   runExport(id).catch((err) => failExport(id, err));
   return id;
+}
+
+// Reads everything in the member's own library. There is no link: the library is theirs by login.
+export function startLibraryExport(ownerId) {
+  const running = db
+    .prepare(`SELECT id FROM exports WHERE owner_id = ? AND status IN ('running', 'pausing') LIMIT 1`)
+    .get(ownerId);
+  if (running) throw new Error('你的文档库正在读取中');
+  const { apiBase, host } = appConfig('source');
+  const { lastInsertRowid } = db
+    .prepare(
+      `INSERT INTO exports (source_url, host, api_base, root_token, root_title, phase, created_at, owner_id)
+       VALUES ('', ?, ?, ?, '我的文档库', 'tree', ?, ?)`,
+    )
+    .run(host, apiBase, MY_LIBRARY, Date.now(), ownerId);
+  const id = Number(lastInsertRowid);
+  runExport(id).catch((err) => failExport(id, err));
+  return id;
+}
+
+// Removes a read and its copies of the documents from this server. Lark itself is not touched.
+export function deleteExport(id) {
+  const job = getExport(id);
+  const busy = db
+    .prepare(`SELECT COUNT(*) AS n FROM migrations WHERE export_id = ? AND status IN ('running', 'pausing')`)
+    .get(id).n;
+  const reading = db.prepare(`SELECT COUNT(*) AS n FROM nodes WHERE export_id = ? AND status = 'reading'`).get(id).n;
+  if (isActive(job.status) || busy || reading) throw new Error('还有任务在进行中，请等它停下后再删除');
+  db.prepare('DELETE FROM exports WHERE id = ?').run(id);
+  rmSync(join(BLOB_DIR, String(id)), { recursive: true, force: true });
 }
 
 const isActive = (status) => status === 'running' || status === 'pausing';
@@ -63,7 +95,7 @@ export function retryNode(exportId, nodeId) {
   if (!node) throw new Error('找不到这个文档');
   if (node.status !== 'failed') throw new Error('只有读取失败的文档可以重试');
   markReading(node);
-  readNodeSafely(clientFor('source', job.api_base), job, node).finally(() => settleExport(exportId));
+  readNodeSafely(clientForJob('source', job), job, node).finally(() => settleExport(exportId));
 }
 
 function markReading(node) {
@@ -101,7 +133,7 @@ function failExport(id, err) {
 
 async function runExport(id) {
   const job = db.prepare('SELECT * FROM exports WHERE id = ?').get(id);
-  const client = clientFor('source', job.api_base);
+  const client = clientForJob('source', job);
 
   // A walk that died midway leaves a partial tree, which must not pass for the whole subtree.
   if (!job.tree_complete) {
@@ -122,8 +154,7 @@ async function runExport(id) {
 }
 
 async function readTree(client, job) {
-  const { node: root } = await client.get('/wiki/v2/spaces/get_node', { token: job.root_token });
-  db.prepare('UPDATE exports SET root_title = ? WHERE id = ?').run(root.title, job.id);
+  const roots = job.owner_id === null ? [await linkedRoot(client, job)] : await libraryRoots(client, job);
 
   const insert = db.prepare(
     `INSERT INTO nodes (export_id, node_token, parent_token, obj_token, obj_type, node_type,
@@ -147,9 +178,9 @@ async function readTree(client, job) {
 
   // Walked level by level so siblings can be listed in parallel. Rows go in as they are
   // found to keep the live count moving, and get their final order once the walk is done.
-  record(root, null, 0);
+  for (const root of roots) record(root, null, 0);
   const childrenOf = new Map();
-  let level = [root];
+  let level = roots;
   for (let depth = 1; level.length; depth++) {
     const parents = level.filter((node) => node.has_child);
     const next = [];
@@ -175,12 +206,27 @@ async function readTree(client, job) {
   };
   db.exec('BEGIN');
   try {
-    number(root);
+    roots.forEach(number);
     db.exec('COMMIT');
   } catch (err) {
     db.exec('ROLLBACK');
     throw err;
   }
+}
+
+async function linkedRoot(client, job) {
+  const { node: root } = await client.get('/wiki/v2/spaces/get_node', { token: job.root_token });
+  db.prepare('UPDATE exports SET root_title = ? WHERE id = ?').run(root.title, job.id);
+  return root;
+}
+
+async function libraryRoots(client, job) {
+  const { space } = await client.get(`/wiki/v2/spaces/${MY_LIBRARY}`);
+  const roots = await client.all(`/wiki/v2/spaces/${space.space_id}/nodes`, { page_size: 50 });
+  if (roots.length) {
+    db.prepare('UPDATE exports SET host = ? WHERE id = ?').run(await documentHost(client, roots[0], job.host), job.id);
+  }
+  return roots;
 }
 
 async function readNode(client, job, node) {

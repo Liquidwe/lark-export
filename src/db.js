@@ -89,6 +89,32 @@ db.exec(`
   );
 
   CREATE INDEX IF NOT EXISTS idx_nodes_export ON nodes(export_id, position);
+
+  CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    open_id TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS sessions (
+    token_hash TEXT PRIMARY KEY,
+    role TEXT NOT NULL,
+    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    expires_at INTEGER NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS lark_accounts (
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    side TEXT NOT NULL,
+    open_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    access_token TEXT NOT NULL,
+    refresh_token TEXT,
+    access_expires_at INTEGER,
+    refresh_expires_at INTEGER,
+    PRIMARY KEY (user_id, side)
+  );
 `);
 
 // Volumes outlive the image, so columns added later have to be added to existing databases too.
@@ -98,6 +124,8 @@ function addColumn(table, column, definition) {
 }
 addColumn('migrations', 'active_ms', 'INTEGER NOT NULL DEFAULT 0');
 addColumn('migration_items', 'duration_ms', 'INTEGER NOT NULL DEFAULT 0');
+// NULL means the admin, which also covers records from before there were members.
+addColumn('exports', 'owner_id', 'INTEGER REFERENCES users(id)');
 
 // A restart kills in-process jobs, so anything still "running" can never finish on its own.
 db.exec(`

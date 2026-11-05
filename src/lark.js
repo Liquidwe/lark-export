@@ -65,18 +65,21 @@ export function parseWikiUrl(input) {
 }
 
 export class LarkClient {
-  constructor({ appId, appSecret, apiBase }) {
-    if (!appId || !appSecret) throw new Error('缺少机器人的 App ID 或 App Secret 环境变量');
+  // tokenProvider makes the client act as a user; nextSlots lets it share its app's throttle.
+  constructor({ appId, appSecret, apiBase, tokenProvider, nextSlots }) {
+    if (!tokenProvider && (!appId || !appSecret)) throw new Error('缺少机器人的 App ID 或 App Secret 环境变量');
     this.appId = appId;
     this.appSecret = appSecret;
     this.apiBase = apiBase;
     this.cachedToken = null;
     this.tokenExpiresAt = 0;
     this.pendingToken = null;
-    this.nextSlots = new Map();
+    this.tokenProvider = tokenProvider;
+    this.nextSlots = nextSlots ?? new Map();
   }
 
   async token() {
+    if (this.tokenProvider) return this.tokenProvider();
     if (this.cachedToken && Date.now() < this.tokenExpiresAt) return this.cachedToken;
     // Concurrent callers share one refresh.
     this.pendingToken ??= this.fetchToken().finally(() => {
@@ -356,6 +359,35 @@ export function limiter(limit) {
 export function concurrencyFromEnv(name, fallback, max) {
   const value = Number.parseInt(process.env[name], 10);
   return value >= 1 ? Math.min(value, max) : fallback;
+}
+
+// Each organization has its own domain, and only a document's own URL reveals it.
+export async function documentHost(client, node, fallback) {
+  try {
+    const { metas } = await client.post('/drive/v1/metas/batch_query', {
+      request_docs: [{ doc_token: node.obj_token, doc_type: node.obj_type }],
+      with_url: true,
+    });
+    return new URL(metas[0].url).origin;
+  } catch {
+    return fallback;
+  }
+}
+
+const BRANDS = {
+  lark: { apiBase: 'https://open.larksuite.com/open-apis', accountsBase: 'https://accounts.larksuite.com', host: 'https://www.larksuite.com' },
+  feishu: { apiBase: 'https://open.feishu.cn/open-apis', accountsBase: 'https://accounts.feishu.cn', host: 'https://www.feishu.cn' },
+};
+
+// The bot and platform on each side. Members give no link, so the platform comes from configuration.
+export function appConfig(side) {
+  const useTarget = side === 'target' && process.env.LARK_TARGET_APP_ID;
+  const brand = BRANDS[(useTarget && process.env.LARK_TARGET_BRAND) || process.env.LARK_BRAND || 'lark'] ?? BRANDS.lark;
+  return {
+    ...brand,
+    appId: useTarget ? process.env.LARK_TARGET_APP_ID : process.env.LARK_APP_ID,
+    appSecret: useTarget ? process.env.LARK_TARGET_APP_SECRET : process.env.LARK_APP_SECRET,
+  };
 }
 
 const clients = new Map();

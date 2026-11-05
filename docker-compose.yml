@@ -11,8 +11,9 @@ services:
       PORT: 4310
       DATA_DIR: /app/data
     ports:
-      # Published on localhost only: the tool has no login and holds the bots' credentials.
-      - "127.0.0.1:${PORT:-4310}:4310"
+      # Localhost unless BIND_ADDRESS says otherwise. Sign-ins and documents pass through this
+      # port, so anything beyond one machine belongs behind an HTTPS reverse proxy.
+      - "${BIND_ADDRESS:-127.0.0.1}:${PORT:-4310}:4310"
     volumes:
       - lark-export-data:/app/data
 
