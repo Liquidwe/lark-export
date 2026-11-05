@@ -268,33 +268,47 @@ function saveAsset(exportId, node, kind, token, buffer, fileName) {
   ).run(exportId, node.id, kind, token, fileName ?? null, path, buffer.length);
 }
 
+// A file that cannot be downloaded costs that file, not the document around it.
+async function downloadOrSkip(client, token, label, warnings, stats) {
+  try {
+    return await client.download(`/drive/v1/medias/${token}/download`);
+  } catch (err) {
+    warnings.push(`${label}无法下载，已跳过: ${err.message}`);
+    stats.skipped = (stats.skipped ?? 0) + 1;
+    return null;
+  }
+}
+
 async function readDocx(client, node, saved) {
   const blocks = await client.all(`/docx/v1/documents/${node.obj_token}/blocks`, {
     page_size: 500,
     document_revision_id: -1,
   });
   const warnings = [];
-  const stats = { blocks: blocks.length, images: 0, files: 0, boards: 0, embeds: 0 };
+  const stats = { blocks: blocks.length, images: 0, files: 0, boards: 0, embeds: 0, fields: 0, records: 0, attachments: 0 };
   const embeddedSheets = {};
   const boards = {};
   const embeddedBitables = {};
-  const embedStats = { fields: 0, records: 0, attachments: 0 };
 
   for (const block of blocks) {
     if (block.block_type === BLOCK_IMAGE && block.image?.token) {
-      const file = await client.download(`/drive/v1/medias/${block.image.token}/download`);
-      saved('image', block.image.token, file.buffer, file.fileName);
-      stats.images++;
+      const file = await downloadOrSkip(client, block.image.token, '图片', warnings, stats);
+      if (file) {
+        saved('image', block.image.token, file.buffer, file.fileName);
+        stats.images++;
+      }
     } else if (block.block_type === BLOCK_FILE && block.file?.token) {
-      const file = await client.download(`/drive/v1/medias/${block.file.token}/download`);
-      saved('file', block.file.token, file.buffer, file.fileName ?? block.file.name);
-      stats.files++;
+      const file = await downloadOrSkip(client, block.file.token, `附件「${block.file.name ?? '未命名'}」`, warnings, stats);
+      if (file) {
+        saved('file', block.file.token, file.buffer, file.fileName ?? block.file.name);
+        stats.files++;
+      }
     } else if (block.block_type === BLOCK_BOARD && block.board?.token) {
       const { nodes = [] } = await client.get(`/board/v1/whiteboards/${block.board.token}/nodes`);
       for (const boardNode of nodes) {
         if (!boardNode.image?.token) continue;
-        const file = await client.download(`/drive/v1/medias/${boardNode.image.token}/download`);
-        saved('board-image', boardNode.image.token, file.buffer, file.fileName);
+        const file = await downloadOrSkip(client, boardNode.image.token, '画板中的图片', warnings, stats);
+        if (file) saved('board-image', boardNode.image.token, file.buffer, file.fileName);
       }
       boards[block.block_id] = nodes;
       stats.boards++;
@@ -307,7 +321,8 @@ async function readDocx(client, node, saved) {
           block.bitable.token.slice(0, separator),
           { table_id: block.bitable.token.slice(separator + 1) },
           saved,
-          embedStats,
+          stats,
+          warnings,
         );
         stats.embeds++;
       } catch (err) {
@@ -326,7 +341,7 @@ async function readDocx(client, node, saved) {
   }
   return {
     content: { blocks, embeddedSheets, boards, embeddedBitables },
-    stats: { ...stats, ...embedStats },
+    stats,
     warnings: [...new Set(warnings)],
   };
 }
@@ -388,14 +403,15 @@ async function readBitable(client, node, saved) {
   const tables = await client.all(`/bitable/v1/apps/${app}/tables`, { page_size: 100 });
   const stats = { tables: tables.length, fields: 0, records: 0, attachments: 0 };
   const content = { tables: [] };
+  const warnings = [];
 
   for (const table of tables) {
-    content.tables.push(await readBitableTable(client, app, table, saved, stats));
+    content.tables.push(await readBitableTable(client, app, table, saved, stats, warnings));
   }
-  return { content, stats, warnings: [] };
+  return { content, stats, warnings };
 }
 
-async function readBitableTable(client, app, table, saved, stats) {
+async function readBitableTable(client, app, table, saved, stats, warnings) {
   const base = `/bitable/v1/apps/${app}/tables/${table.table_id}`;
   const fields = await client.all(`${base}/fields`, { page_size: 100 });
   const views = await client.all(`${base}/views`, { page_size: 100 });
@@ -410,9 +426,11 @@ async function readBitableTable(client, app, table, saved, stats) {
       for (const item of record.fields[name] || []) {
         if (seen.has(item.file_token)) continue;
         seen.add(item.file_token);
-        const file = await client.download(`/drive/v1/medias/${item.file_token}/download`);
-        saved('attachment', item.file_token, file.buffer, item.name);
-        stats.attachments++;
+        const file = await downloadOrSkip(client, item.file_token, `附件「${item.name}」`, warnings, stats);
+        if (file) {
+          saved('attachment', item.file_token, file.buffer, item.name);
+          stats.attachments++;
+        }
       }
     }
   }

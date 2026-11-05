@@ -57,7 +57,7 @@ export async function writeDocx({ client, documentId, content, assets, linkFor, 
   const convert = (sourceId) => {
     const source = byId.get(sourceId);
     if (!source) return null;
-    const block = toTargetBlock(source, { linkFor, warn, assets, uploads, merges, sheets, boards, bitables, content });
+    const block = toTargetBlock(source, { byId, linkFor, warn, assets, uploads, merges, sheets, boards, bitables, content });
     const children = block.__leaf ? [] : (source.children || []).map(convert).filter(Boolean);
     delete block.__leaf;
     if (!children.length && NEEDS_CHILD.has(block.block_type)) {
@@ -221,13 +221,22 @@ async function fillBoard({ client, documentId, relations, board, assets, warn })
   for (const node of nodes) {
     if (!node.image?.token) continue;
     const asset = assets.get(`board-image:${node.image.token}`);
-    if (!asset) throw new Error('画板中的图片未在本地找到，请重新读取');
-    node.image.token = await client.upload({
-      buffer: readFileSync(asset.path),
-      fileName: asset.file_name || `${node.image.token}.png`,
-      parentType: 'whiteboard',
-      parentNode: boardId,
-    });
+    if (!asset) {
+      markMissingImage(node);
+      warn('画板中缺少的图片已替换为文字框');
+      continue;
+    }
+    try {
+      node.image.token = await client.upload({
+        buffer: readFileSync(asset.path),
+        fileName: asset.file_name || `${node.image.token}.png`,
+        parentType: 'whiteboard',
+        parentNode: boardId,
+      });
+    } catch (err) {
+      markMissingImage(node);
+      warn(`画板中的图片上传失败，已替换为文字框: ${err.message}`);
+    }
   }
 
   // Lark rejects user IDs from another tenant, and one bad node fails the whole board.
@@ -244,6 +253,15 @@ async function fillBoard({ client, documentId, relations, board, assets, warn })
 
   // Node references are only remapped within one request, so a board must be written in one batch.
   await client.post(`/board/v1/whiteboards/${boardId}/nodes`, { nodes }, { client_token: randomUUID() });
+}
+
+// Connectors and frames refer to nodes by ID, and one dangling reference fails the whole board,
+// so the node stays where it is as a shape rather than being removed.
+function markMissingImage(node) {
+  delete node.image;
+  node.type = 'composite_shape';
+  node.composite_shape = { type: 'round_rect' };
+  node.text = { text: '[未迁移的图片]' };
 }
 
 function batchRoots(roots, descendants) {
@@ -307,8 +325,12 @@ function toTargetBlock(source, ctx) {
       return { block_id: id, block_type: type, iframe: { component: source.iframe.component } };
     case 32:
       return { block_id: id, block_type: type, table_cell: {} };
-    case 33:
+    case 33: {
+      // A view holds only its file, so text standing in for the file replaces the view too.
+      const file = (source.children ?? []).map((child) => ctx.byId.get(child)).find((block) => block?.block_type === 23);
+      if (file && !ctx.assets.has(`file:${file.file?.token}`)) return missingAsset(id, fileLabel(file), ctx);
       return { block_id: id, block_type: type, view: { view_type: source.view?.view_type ?? 1 } };
+    }
     case 34:
       return { block_id: id, block_type: type, quote_container: {} };
     case 31: {
@@ -323,9 +345,11 @@ function toTargetBlock(source, ctx) {
       };
     }
     case 27:
+      if (!ctx.assets.has(`image:${source.image?.token}`)) return missingAsset(id, '图片', ctx);
       ctx.uploads.push({
         id,
         kind: 'image',
+        label: '图片',
         assetKey: `image:${source.image?.token}`,
         width: source.image?.width,
         height: source.image?.height,
@@ -341,7 +365,8 @@ function toTargetBlock(source, ctx) {
       ctx.boards.push({ id, nodes: ctx.content.boards?.[id] ?? [] });
       return { block_id: id, block_type: 43, board: {}, __leaf: true };
     case 23:
-      ctx.uploads.push({ id, kind: 'file', assetKey: `file:${source.file?.token}` });
+      if (!ctx.assets.has(`file:${source.file?.token}`)) return missingAsset(id, fileLabel(source), ctx);
+      ctx.uploads.push({ id, kind: 'file', label: fileLabel(source), assetKey: `file:${source.file?.token}` });
       return { block_id: id, block_type: 23, file: { token: '' }, __leaf: true };
     case 30: {
       const values = ctx.content.embeddedSheets?.[id] ?? [];
@@ -357,6 +382,20 @@ function toTargetBlock(source, ctx) {
 
 function placeholder(id, label, ctx) {
   ctx.warn(`${label} 无法迁移，已替换为文字占位`);
+  return placeholderBlock(id, label);
+}
+
+// The read already named each skipped file and why, so this only says what became of them.
+function missingAsset(id, label, ctx) {
+  ctx.warn('没有读取到的图片和附件已替换为文字占位');
+  return placeholderBlock(id, label);
+}
+
+function fileLabel(block) {
+  return block.file?.name ? `附件「${block.file.name}」` : '附件';
+}
+
+function placeholderBlock(id, label) {
   return {
     block_id: id,
     block_type: 2,
@@ -441,22 +480,23 @@ async function applyUpload({ client, documentId, relations, upload, assets, warn
   const blockId = relations.get(upload.id);
   if (!blockId) return;
   const asset = assets.get(upload.assetKey);
-  if (!asset) {
-    warn('有图片或附件未能在本地找到，对应块留空');
-    return;
+  // One refused file should cost that block, not the whole document.
+  try {
+    const token = await client.upload({
+      buffer: readFileSync(asset.path),
+      fileName: asset.file_name || `${upload.kind}-${upload.id}`,
+      parentType: upload.kind === 'image' ? 'docx_image' : 'docx_file',
+      parentNode: blockId,
+      extra: JSON.stringify({ drive_route_token: documentId }),
+    });
+    const body =
+      upload.kind === 'image'
+        ? { replace_image: { token, width: upload.width, height: upload.height } }
+        : { replace_file: { token } };
+    await client.patch(`/docx/v1/documents/${documentId}/blocks/${blockId}`, body, { document_revision_id: -1 });
+  } catch (err) {
+    warn(`${upload.label}上传失败，对应的块留空: ${err.message}`);
   }
-  const token = await client.upload({
-    buffer: readFileSync(asset.path),
-    fileName: asset.file_name || `${upload.kind}-${upload.id}`,
-    parentType: upload.kind === 'image' ? 'docx_image' : 'docx_file',
-    parentNode: blockId,
-    extra: JSON.stringify({ drive_route_token: documentId }),
-  });
-  const body =
-    upload.kind === 'image'
-      ? { replace_image: { token, width: upload.width, height: upload.height } }
-      : { replace_file: { token } };
-  await client.patch(`/docx/v1/documents/${documentId}/blocks/${blockId}`, body, { document_revision_id: -1 });
 }
 
 async function applyMerge({ client, documentId, relations, merge, warn }) {

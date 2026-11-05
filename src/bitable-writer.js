@@ -229,20 +229,26 @@ async function convertValue({ client, appToken, field, raw, assets, uploaded, wa
         if (!uploaded.has(item.file_token)) {
           const asset = assets.get(`attachment:${item.file_token}`);
           if (!asset) {
-            warn(`附件「${item.name}」未在本地找到，已跳过`);
+            warn('没有读取到的附件已跳过');
             continue;
           }
-          uploaded.set(
-            item.file_token,
-            await client.upload({
-              buffer: readFileSync(asset.path),
-              fileName: asset.file_name || item.name,
-              parentType: 'bitable_file',
-              parentNode: appToken,
-            }),
-          );
+          // One refused file should cost that attachment, not the whole table.
+          try {
+            uploaded.set(
+              item.file_token,
+              await client.upload({
+                buffer: readFileSync(asset.path),
+                fileName: asset.file_name || item.name,
+                parentType: 'bitable_file',
+                parentNode: appToken,
+              }),
+            );
+          } catch (err) {
+            uploaded.set(item.file_token, null);
+            warn(`附件「${item.name}」上传失败，已跳过: ${err.message}`);
+          }
         }
-        items.push({ file_token: uploaded.get(item.file_token) });
+        if (uploaded.get(item.file_token)) items.push({ file_token: uploaded.get(item.file_token) });
       }
       return items;
     }

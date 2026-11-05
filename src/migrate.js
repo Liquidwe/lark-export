@@ -404,6 +404,7 @@ async function createNode(ctx, node, item) {
   };
 
   let created;
+  let fallback = {};
   if (node.node_type === 'shortcut') {
     const origin = ctx.nodes.find((n) => n.node_token === node.origin_node_token);
     if (origin) {
@@ -420,7 +421,15 @@ async function createNode(ctx, node, item) {
   } else if (node.status === 'done' && node.obj_type === 'sheet') {
     created = await importSheet(ctx, node, parent);
   } else if (node.status === 'done' && node.obj_type === 'file') {
-    created = await uploadFile(ctx, node, parent);
+    // Its children hang from this node, so a refused upload leaves a stand-in rather than a gap.
+    try {
+      created = await uploadFile(ctx, node, parent);
+    } catch (err) {
+      created = await createWiki('docx');
+      const reason = `文件上传失败: ${err.message}`;
+      await writePlaceholder(ctx, { target_obj_token: created.obj_token }, `${reason}。原始文档: ${ctx.source.host}/wiki/${node.node_token}`);
+      fallback = { status: 'placeholder', warnings: JSON.stringify([reason]) };
+    }
   } else {
     // docx, plus failed/unsupported nodes which become placeholders so children keep their parent.
     created = await createWiki('docx');
@@ -431,6 +440,7 @@ async function createNode(ctx, node, item) {
     target_obj_token: created.obj_token,
     target_obj_type: created.obj_type,
     status: 'created',
+    ...fallback,
   });
   item.target_node_token = created.node_token;
 }

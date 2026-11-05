@@ -36,6 +36,7 @@ const STAT_LABELS = {
   blocks: '内容块',
   images: '图片',
   files: '附件',
+  skipped: '未下载的素材',
   boards: '画板',
   embeds: '内嵌表格',
   sheets: '工作表',
