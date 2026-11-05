@@ -67,6 +67,55 @@ export async function writeBitable({ client, appToken, content, assets, warn }) 
   }
 }
 
+// Fills the table Lark created along with an embedded bitable block. The block points at that
+// table, so unlike writeBitable it has to be reshaped in place rather than replaced.
+export async function writeEmbeddedTable({ client, appToken, tableId, table, assets, warn }) {
+  const base = `/bitable/v1/apps/${appToken}/tables/${tableId}`;
+  const defaults = await client.all(`${base}/fields`, { page_size: 100 });
+  const fields = table.fields.filter((f) => !isLink(f) && f.type !== BUTTON);
+  const sourcePrimary = fields.find((f) => f.is_primary) ?? fields[0];
+  const defaultPrimary = defaults.find((f) => f.is_primary);
+
+  // The primary field cannot be deleted, so it is converted. Other defaults go first, so a
+  // source field that happens to share a default field's name can still be created.
+  await client.request('PUT', `${base}/fields/${defaultPrimary.field_id}`, {
+    body: targetField(sourcePrimary, warn),
+  });
+  for (const field of defaults) {
+    if (field.field_id !== defaultPrimary.field_id) await client.delete(`${base}/fields/${field.field_id}`);
+  }
+  for (const field of fields) {
+    if (field !== sourcePrimary) await client.post(`${base}/fields`, targetField(field, warn));
+  }
+
+  // A new table starts with blank rows.
+  const blanks = await client.all(`${base}/records`, { page_size: 500 });
+  for (let i = 0; i < blanks.length; i += RECORD_BATCH) {
+    await client.post(`${base}/records/batch_delete`, {
+      records: blanks.slice(i, i + RECORD_BATCH).map((record) => record.record_id),
+    });
+  }
+
+  const [firstView, ...otherViews] = table.views;
+  if (firstView) {
+    const [defaultView] = await client.all(`${base}/views`, { page_size: 100 });
+    await client.patch(`${base}/views/${defaultView.view_id}`, { view_name: firstView.view_name });
+  }
+  for (const view of otherViews) await createView(client, appToken, tableId, view, warn);
+  if (table.views.length) warn('视图只迁移了名称和类型，筛选、排序、分组条件需要重新设置');
+
+  const recordMap = await writeRecords({ client, appToken, tableId, table, assets, warn });
+  await writeLinks({
+    client,
+    appToken,
+    table,
+    tableMap: new Map([[table.table_id, tableId]]),
+    recordMap,
+    createdDuplex: new Set(),
+    warn,
+  });
+}
+
 const isLink = (field) => field.type === LINK || field.type === DUPLEX;
 
 function targetField(field, warn) {

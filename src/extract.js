@@ -16,6 +16,7 @@ function readConcurrency() {
 
 const BLOCK_IMAGE = 27;
 const BLOCK_FILE = 23;
+const BLOCK_BITABLE = 18;
 const BLOCK_SHEET = 30;
 const BLOCK_BOARD = 43;
 const BITABLE_ATTACHMENT = 17;
@@ -237,6 +238,8 @@ async function readDocx(client, node, saved) {
   const stats = { blocks: blocks.length, images: 0, files: 0, boards: 0, embeds: 0 };
   const embeddedSheets = {};
   const boards = {};
+  const embeddedBitables = {};
+  const embedStats = { fields: 0, records: 0, attachments: 0 };
 
   for (const block of blocks) {
     if (block.block_type === BLOCK_IMAGE && block.image?.token) {
@@ -256,6 +259,21 @@ async function readDocx(client, node, saved) {
       }
       boards[block.block_id] = nodes;
       stats.boards++;
+    } else if (block.block_type === BLOCK_BITABLE && block.bitable?.token) {
+      // One unreadable embed should cost that block, not the whole document.
+      try {
+        const separator = block.bitable.token.lastIndexOf('_');
+        embeddedBitables[block.block_id] = await readBitableTable(
+          client,
+          block.bitable.token.slice(0, separator),
+          { table_id: block.bitable.token.slice(separator + 1) },
+          saved,
+          embedStats,
+        );
+        stats.embeds++;
+      } catch (err) {
+        warnings.push(`有内嵌多维表格读取失败，迁移后为文字占位: ${err.message}`);
+      }
     } else if (block.block_type === BLOCK_SHEET && block.sheet?.token) {
       // One unreadable embed should cost that block, not the whole document.
       try {
@@ -267,7 +285,11 @@ async function readDocx(client, node, saved) {
       }
     }
   }
-  return { content: { blocks, embeddedSheets, boards }, stats, warnings: [...new Set(warnings)] };
+  return {
+    content: { blocks, embeddedSheets, boards, embeddedBitables },
+    stats: { ...stats, ...embedStats },
+    warnings: [...new Set(warnings)],
+  };
 }
 
 async function readEmbeddedSheet(client, token) {
@@ -329,35 +351,39 @@ async function readBitable(client, node, saved) {
   const content = { tables: [] };
 
   for (const table of tables) {
-    const base = `/bitable/v1/apps/${app}/tables/${table.table_id}`;
-    const fields = await client.all(`${base}/fields`, { page_size: 100 });
-    const views = await client.all(`${base}/views`, { page_size: 100 });
-    const records = await client.all(`${base}/records`, { page_size: 500 });
-    stats.fields += fields.length;
-    stats.records += records.length;
-
-    const attachmentFields = fields.filter((f) => f.type === BITABLE_ATTACHMENT).map((f) => f.field_name);
-    const seen = new Set();
-    for (const record of records) {
-      for (const name of attachmentFields) {
-        for (const item of record.fields[name] || []) {
-          if (seen.has(item.file_token)) continue;
-          seen.add(item.file_token);
-          const file = await client.download(`/drive/v1/medias/${item.file_token}/download`);
-          saved('attachment', item.file_token, file.buffer, item.name);
-          stats.attachments++;
-        }
-      }
-    }
-    content.tables.push({
-      table_id: table.table_id,
-      name: table.name,
-      fields,
-      views,
-      records: records.map(({ record_id, fields: values }) => ({ record_id, fields: values })),
-    });
+    content.tables.push(await readBitableTable(client, app, table, saved, stats));
   }
   return { content, stats, warnings: [] };
+}
+
+async function readBitableTable(client, app, table, saved, stats) {
+  const base = `/bitable/v1/apps/${app}/tables/${table.table_id}`;
+  const fields = await client.all(`${base}/fields`, { page_size: 100 });
+  const views = await client.all(`${base}/views`, { page_size: 100 });
+  const records = await client.all(`${base}/records`, { page_size: 500 });
+  stats.fields += fields.length;
+  stats.records += records.length;
+
+  const attachmentFields = fields.filter((f) => f.type === BITABLE_ATTACHMENT).map((f) => f.field_name);
+  const seen = new Set();
+  for (const record of records) {
+    for (const name of attachmentFields) {
+      for (const item of record.fields[name] || []) {
+        if (seen.has(item.file_token)) continue;
+        seen.add(item.file_token);
+        const file = await client.download(`/drive/v1/medias/${item.file_token}/download`);
+        saved('attachment', item.file_token, file.buffer, item.name);
+        stats.attachments++;
+      }
+    }
+  }
+  return {
+    table_id: table.table_id,
+    name: table.name,
+    fields,
+    views,
+    records: records.map(({ record_id, fields: values }) => ({ record_id, fields: values })),
+  };
 }
 
 async function readFile(client, node, saved) {

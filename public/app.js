@@ -188,7 +188,7 @@ async function showExport(id) {
       <h2>写回到另一个位置</h2>
       <form id="migrate" class="form-row">
         <input id="target-url" type="url" required value="${esc(draft.target)}"
-          placeholder="目标知识库节点链接，内容会成为它的子节点" aria-label="目标文档链接" />
+          placeholder="目标知识库节点链接，它会变成源目录的第一层" aria-label="目标文档链接" />
         <button type="submit" ${isActive(job.status) || migrating || !job.tree_complete || unread ? 'disabled' : ''}>开始迁移</button>
       </form>
       ${unread && !isActive(job.status) ? `<p class="hint">还有 ${unread} 个文档没有读取完，继续读取后才能迁移。</p>` : ''}
@@ -208,8 +208,9 @@ async function showExport(id) {
     const unread = job.byStatus.failed
       ? `\n\n注意：有 ${job.byStatus.failed} 个节点读取失败，迁移后只有占位文档。建议先重试读取。`
       : '';
-    if (!confirm(`将创建 ${job.total} 个新节点到：\n${draft.target}${unread}\n\n确认开始迁移？`)) return;
     try {
+      const preview = await api(`/api/exports/${id}/migration-preview`, { url: draft.target });
+      if (!confirm(`${describeMigration(job, preview)}${unread}\n\n确认开始迁移？`)) return;
       await api(`/api/exports/${id}/migrations`, { url: draft.target });
       draft.error = '';
     } catch (err) {
@@ -244,6 +245,22 @@ app.addEventListener('click', async (event) => {
   }
   route();
 });
+
+function describeMigration(job, preview) {
+  const lines = [];
+  if (preview.overwrite) {
+    lines.push(`目标文档「${preview.targetTitle}」会改名为「${preview.rootTitle}」。`);
+    if (preview.bodyBlocks) lines.push(`它现有的正文（${preview.bodyBlocks} 个内容块）会被覆盖，之后只能尝试从 Lark 文档的历史记录中找回。`);
+    lines.push(`其余 ${job.total - 1} 个节点会写到它下面，层级保持不变。`);
+  } else {
+    const reason = preview.rootType !== 'docx' || preview.targetType !== 'docx'
+      ? `只有文档之间才能合并（源是 ${typeLabel(preview.rootType)}，目标是 ${typeLabel(preview.targetType)}）`
+      : '源文档没有读取成功';
+    lines.push(`${reason}，所以「${preview.rootTitle}」会作为子节点写到「${preview.targetTitle}」下面，共 ${job.total} 个节点。`);
+  }
+  if (preview.childCount) lines.push(`目标下已有的 ${preview.childCount} 个子节点会保留，新内容排在它们后面。`);
+  return lines.join('\n');
+}
 
 function nodeRow(node) {
   const stats = Object.entries(node.stats)

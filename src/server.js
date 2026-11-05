@@ -4,7 +4,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { db, parseJson } from './db.js';
 import { pauseExport, resumeExport, retryNode, startExport } from './extract.js';
-import { pauseMigration, resumeMigration, startMigration } from './migrate.js';
+import { pauseMigration, previewMigration, resumeMigration, startMigration } from './migrate.js';
 
 const PORT = Number(process.env.PORT || 4310);
 // There is no login, so anything beyond localhost is an explicit choice.
@@ -125,6 +125,10 @@ async function handleApi(req, res, path) {
     await readJson(req);
     pauseMigration(Number(match[1]));
     return send(res, 200, { ok: true });
+  }
+  if (req.method === 'POST' && (match = path.match(/^\/api\/exports\/(\d+)\/migration-preview$/))) {
+    const { url } = await readJson(req);
+    return send(res, 200, await previewMigration(Number(match[1]), url));
   }
   if (req.method === 'POST' && (match = path.match(/^\/api\/exports\/(\d+)\/migrations$/))) {
     const { url } = await readJson(req);

@@ -20,6 +20,7 @@ export function startMigration(exportId, targetUrl) {
     .get(exportId).n;
   if (unread) throw new Error(`还有 ${unread} 个文档没有读取完，请先继续读取`);
   const { host, token, apiBase } = parseWikiUrl(targetUrl);
+  assertTargetOutsideSource(exportId, token);
   const { lastInsertRowid } = db
     .prepare(
       `INSERT INTO migrations (export_id, target_url, target_host, api_base, target_token, phase, created_at)
@@ -33,6 +34,44 @@ export function startMigration(exportId, targetUrl) {
   }
   run(id);
   return id;
+}
+
+function assertTargetOutsideSource(exportId, token) {
+  const inside = db.prepare('SELECT title FROM nodes WHERE export_id = ? AND node_token = ?').get(exportId, token);
+  // The target's body gets overwritten, so this would destroy the very document being migrated.
+  if (inside) throw new Error(`目标是源目录中的文档「${inside.title}」，请换一个目录之外的位置`);
+}
+
+// The target takes on the source root's title and body, and children go directly under it.
+// That only works doc to doc: a wiki node cannot change type.
+function rootBecomesTarget(root, target) {
+  return root.status === 'done' && root.obj_type === 'docx' && root.node_type !== 'shortcut' && target.obj_type === 'docx';
+}
+
+// Describes what a migration would do to the target, so it can be confirmed before anything is overwritten.
+export async function previewMigration(exportId, targetUrl) {
+  const { token, apiBase } = parseWikiUrl(targetUrl);
+  assertTargetOutsideSource(exportId, token);
+  const client = clientFor('target', apiBase);
+  const { node: target } = await client.get('/wiki/v2/spaces/get_node', { token });
+  const root = db.prepare('SELECT * FROM nodes WHERE export_id = ? AND parent_token IS NULL').get(exportId);
+  if (!root) throw new Error('目录没有读取完整，请先重试读取');
+  const children = target.has_child
+    ? await client.all(`/wiki/v2/spaces/${target.space_id}/nodes`, { parent_node_token: target.node_token, page_size: 50 })
+    : [];
+  const overwrite = rootBecomesTarget(root, target);
+  let bodyBlocks = 0;
+  if (overwrite) {
+    const blocks = await client.all(`/docx/v1/documents/${target.obj_token}/blocks`, { page_size: 500 });
+    bodyBlocks = blocks.filter(hasContent).length;
+  }
+  return { overwrite, targetTitle: target.title, rootTitle: root.title, rootType: root.obj_type, targetType: target.obj_type, childCount: children.length, bodyBlocks };
+}
+
+// A new document holds one empty line, which is not worth warning about.
+function hasContent(block) {
+  if (block.block_type === 1) return false;
+  return block.block_type !== 2 || block.text?.elements?.some((e) => e.text_run?.content !== '');
 }
 
 // Stops before the next node. The node in progress finishes, then the run settles as paused.
@@ -73,7 +112,7 @@ async function runMigration(id) {
     db.prepare('SELECT * FROM migration_items WHERE migration_id = ?').all(id).map((item) => [item.node_id, item]),
   );
   const assets = loadAssets(job.export_id);
-  const ctx = { client, job, source, spaceId: target.space_id, rootToken: target.node_token, nodes, items, assets };
+  const ctx = { client, job, source, target, spaceId: target.space_id, rootToken: target.node_token, nodes, items, assets };
 
   // Shortcuts need their origin node to exist, so they go after every real node.
   const ordered = [...nodes.filter((n) => n.node_type !== 'shortcut'), ...nodes.filter((n) => n.node_type === 'shortcut')];
@@ -139,6 +178,17 @@ function parentOf(ctx, node) {
 }
 
 async function createNode(ctx, node, item) {
+  if (node.parent_token === null && rootBecomesTarget(node, ctx.target)) {
+    await ctx.client.post(`/wiki/v2/spaces/${ctx.spaceId}/nodes/${ctx.rootToken}/update_title`, { title: node.title });
+    setItem(ctx.job.id, node.id, {
+      target_node_token: ctx.target.node_token,
+      target_obj_token: ctx.target.obj_token,
+      target_obj_type: ctx.target.obj_type,
+      status: 'created',
+    });
+    item.target_node_token = ctx.target.node_token;
+    return;
+  }
   const parent = parentOf(ctx, node);
   const createWiki = async (objType, extra = {}) => {
     const { node: created } = await ctx.client.post(`/wiki/v2/spaces/${ctx.spaceId}/nodes`, {
@@ -278,6 +328,9 @@ async function fillNode(ctx, node, item, linkFor) {
   const assets = ctx.assets.get(node.id) ?? new Map();
   const content = parseJson(node.content);
   let finalStatus = 'done';
+  if (node.parent_token === null && item.target_node_token !== ctx.rootToken) {
+    warn(`源文档是${node.obj_type}类型，无法合并到目标文档，已放在目标节点下面`);
+  }
 
   if (node.node_type === 'shortcut') {
     // A shortcut whose origin was migrated is already complete; otherwise createNode made a docx stand-in.

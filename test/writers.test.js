@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { writeBitable } from '../src/bitable-writer.js';
 import { writeDocx } from '../src/docx-writer.js';
+import { LarkApiError } from '../src/lark.js';
 
 function fakeClient(handlers = {}) {
   const calls = [];
@@ -224,4 +225,198 @@ test('docx: resource blocks are split across create calls and keep document orde
   assert.deepEqual(calls.map((c) => c.body.children_id.length), [5, 5, 2]);
   assert.deepEqual(calls.map((c) => c.body.index), [0, 5, 10]);
   assert.deepEqual(calls.flatMap((c) => c.body.children_id), ids);
+});
+
+function rejectingClient(isRejected) {
+  const client = fakeClient({ 'GET .*/blocks/T$': () => ({ block: { children: [] } }) });
+  const accepted = [];
+  const realPost = client.post;
+  client.accepted = accepted;
+  client.post = async (path, body, query) => {
+    if (path.endsWith('/descendant')) {
+      if (body.descendants.some(isRejected)) {
+        throw new LarkApiError('rejected', { code: 1770001 });
+      }
+      accepted.push({ index: body.index, roots: body.children_id, blocks: body.descendants });
+      return { block_id_relations: [] };
+    }
+    return realPost(path, body, query);
+  };
+  return client;
+}
+
+test('docx: a line holding only a dropped inline element is sent with an empty run, not an empty list', async () => {
+  const blocks = [
+    { block_id: 'doc', block_type: 1, children: ['a', 'b'], page: {} },
+    { block_id: 'a', block_type: 2, text: { elements: [{ inline_block: { block_id: 'x' } }] } },
+    { block_id: 'b', block_type: 17, todo: { elements: [] } },
+  ];
+  const client = fakeClient({ 'GET .*/blocks/T$': () => ({ block: { children: [] } }), 'POST .*/descendant': () => ({}) });
+  const warnings = [];
+  await writeDocx({ client, documentId: 'T', content: { blocks }, assets: new Map(), linkFor: () => null, warn: (m) => warnings.push(m) });
+  const sent = client.calls.find((c) => c.path.endsWith('/descendant')).body.descendants;
+  for (const [i, key] of [[0, 'text'], [1, 'todo']]) {
+    assert.deepEqual(sent[i][key].elements, [{ text_run: { content: '' } }]);
+  }
+  assert.equal(warnings.length, 1);
+});
+
+test('docx: containers without children get an empty line, which Lark requires', async () => {
+  const blocks = [
+    { block_id: 'doc', block_type: 1, children: ['c', 'q'], page: {} },
+    { block_id: 'c', block_type: 19, callout: { emoji_id: 'gift' } },
+    { block_id: 'q', block_type: 34, quote_container: {} },
+  ];
+  const client = fakeClient({ 'GET .*/blocks/T$': () => ({ block: { children: [] } }), 'POST .*/descendant': () => ({}) });
+  await writeDocx({ client, documentId: 'T', content: { blocks }, assets: new Map(), linkFor: () => null, warn: () => {} });
+  const sent = client.calls.find((c) => c.path.endsWith('/descendant')).body;
+  const byId = Object.fromEntries(sent.descendants.map((d) => [d.block_id, d]));
+  assert.deepEqual(byId.c.children, ['c-empty']);
+  assert.deepEqual(byId.q.children, ['q-empty']);
+  assert.equal(byId['c-empty'].block_type, 2);
+  assert.deepEqual(sent.children_id, ['c', 'q']);
+});
+
+test('docx: links Lark would refuse lose the link and keep the text', async () => {
+  const blocks = [
+    { block_id: 'doc', block_type: 1, children: ['a', 'b', 'c'], page: {} },
+    text('a', 'relative', { link: { url: encodeURIComponent('/wiki/abc') } }),
+    text('b', 'good', { link: { url: encodeURIComponent('https://example.com/x') } }),
+    { block_id: 'c', block_type: 2, text: { elements: [{ mention_doc: { title: '无权限文档', url: '' } }] } },
+  ];
+  const client = fakeClient({ 'GET .*/blocks/T$': () => ({ block: { children: [] } }), 'POST .*/descendant': () => ({}) });
+  await writeDocx({ client, documentId: 'T', content: { blocks }, assets: new Map(), linkFor: () => null, warn: () => {} });
+  const byId = Object.fromEntries(client.calls.find((c) => c.path.endsWith('/descendant')).body.descendants.map((d) => [d.block_id, d]));
+  const run = (id) => byId[id].text.elements[0].text_run;
+  assert.equal(run('a').text_element_style.link, undefined);
+  assert.equal(run('a').content, 'relative');
+  assert.equal(decodeURIComponent(run('b').text_element_style.link.url), 'https://example.com/x');
+  assert.equal(run('c').content, '无权限文档');
+  assert.equal(run('c').text_element_style?.link, undefined);
+});
+
+test('docx: one rejected block becomes plain text; the rest keep their format and order', async () => {
+  const ids = ['b1', 'b2', 'bad', 'b4', 'b5'];
+  const blocks = [
+    { block_id: 'doc', block_type: 1, children: ids, page: {} },
+    ...ids.map((id) => ({ block_id: id, block_type: 3, heading1: { elements: [{ text_run: { content: id } }] } })),
+  ];
+  const client = rejectingClient((block) => block.block_id === 'bad');
+  const warnings = [];
+  await writeDocx({ client, documentId: 'T', content: { blocks }, assets: new Map(), linkFor: () => null, warn: (m) => warnings.push(m) });
+
+  const roots = client.accepted.flatMap((call) => call.roots);
+  assert.deepEqual(roots, ['b1', 'b2', 'bad-plain-0', 'b4', 'b5']);
+  let expected = 0;
+  for (const call of client.accepted) {
+    assert.equal(call.index, expected, 'each call inserts right after the previous one');
+    expected += call.roots.length;
+  }
+  const blocksById = Object.fromEntries(client.accepted.flatMap((c) => c.blocks).map((b) => [b.block_id, b]));
+  assert.equal(blocksById.b1.block_type, 3, 'neighbours keep their format');
+  assert.equal(blocksById['bad-plain-0'].block_type, 2);
+  assert.equal(blocksById['bad-plain-0'].text.elements[0].text_run.content, 'bad');
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /1770001/);
+});
+
+test('docx: errors that are not about the content still fail the document', async () => {
+  const blocks = [
+    { block_id: 'doc', block_type: 1, children: ['a'], page: {} },
+    text('a', 'x'),
+  ];
+  const client = fakeClient({ 'GET .*/blocks/T$': () => ({ block: { children: [] } }) });
+  client.post = async () => {
+    throw new LarkApiError('forbidden', { code: 1770032 });
+  };
+  await assert.rejects(
+    writeDocx({ client, documentId: 'T', content: { blocks }, assets: new Map(), linkFor: () => null, warn: () => {} }),
+    /forbidden/,
+  );
+});
+
+test('docx: an embedded bitable is created as a real block and its table filled in place', async () => {
+  const table = {
+    table_id: 'srcTbl',
+    views: [{ view_name: '总览', view_type: 'grid' }],
+    fields: [
+      { field_name: '事项', type: 1, is_primary: true },
+      { field_name: '状态', type: 3, property: { options: [{ id: 'o', name: '开始', color: 1 }] } },
+      { field_name: '自关联', type: 18, property: { table_id: 'srcTbl', multiple: true } },
+    ],
+    records: [
+      { record_id: 'r1', fields: { 事项: '甲', 状态: '开始' } },
+      { record_id: 'r2', fields: { 事项: '乙', 自关联: { link_record_ids: ['r1'] } } },
+    ],
+  };
+  const blocks = [
+    { block_id: 'doc', block_type: 1, children: ['e'], page: {} },
+    { block_id: 'e', block_type: 18, bitable: { token: 'srcApp_srcTbl', view_type: 1 } },
+  ];
+  let created = 0;
+  const client = fakeClient({
+    'GET .*/blocks/T$': () => ({ block: { children: [] } }),
+    'POST .*/descendant': (body) => ({
+      block_id_relations: body.descendants.map((d) => ({ temporary_block_id: d.block_id, block_id: `new-${d.block_id}` })),
+    }),
+    'GET .*/blocks/new-e$': () => ({ block: { bitable: { token: 'newApp_newTbl' } } }),
+    'ALL .*/fields$': () => ({ items: [{ field_id: 'p', field_name: '文本', is_primary: true }, { field_id: 'x', field_name: '状态' }] }),
+    'ALL .*/records$': () => ({ items: [{ record_id: 'blank1' }, { record_id: 'blank2' }] }),
+    'ALL .*/views$': () => ({ items: [{ view_id: 'v1', view_name: '表格' }] }),
+    'POST .*/records/batch_create': (body) => ({ records: body.records.map(() => ({ record_id: `n${++created}` })) }),
+  });
+  const warnings = [];
+  await writeDocx({
+    client,
+    documentId: 'T',
+    content: { blocks, embeddedBitables: { e: table } },
+    assets: new Map(),
+    linkFor: () => null,
+    warn: (m) => warnings.push(m),
+  });
+
+  const sent = client.calls.find((c) => c.path.endsWith('/descendant')).body.descendants[0];
+  assert.equal(sent.block_type, 18, 'not replaced by a placeholder');
+  assert.deepEqual(sent.bitable, { view_type: 1 });
+
+  const base = '/bitable/v1/apps/newApp/tables/newTbl';
+  const order = client.calls.filter((c) => c.path.startsWith(base) && c.method !== 'ALL').map((c) => `${c.method} ${c.path.slice(base.length)}`);
+  assert.equal(order[0], 'PUT /fields/p', 'the primary field is converted first');
+  assert.ok(order.indexOf('DELETE /fields/x') < order.indexOf('POST /fields'), 'a default field is removed before a same-named one is added');
+  assert.ok(order.includes('POST /records/batch_delete'), 'blank rows are removed');
+  assert.ok(!order.some((call) => call.startsWith('DELETE /tables')), 'the table the block points at survives');
+
+  const primary = client.calls.find((c) => c.method === 'PUT' && c.path.endsWith('/fields/p'));
+  assert.equal(primary.body.field_name, '事项');
+  const link = client.calls.find((c) => c.method === 'POST' && c.path === `${base}/fields` && c.body.type === 18);
+  assert.equal(link.body.property.table_id, 'newTbl', 'a self link points at the new table');
+  const update = client.calls.find((c) => c.path.endsWith('batch_update'));
+  assert.deepEqual(update.body.records, [{ record_id: 'n2', fields: { 自关联: ['n1'] } }]);
+});
+
+test('docx: an embedded bitable that could not be read falls back to a placeholder', async () => {
+  const blocks = [
+    { block_id: 'doc', block_type: 1, children: ['e'], page: {} },
+    { block_id: 'e', block_type: 18, bitable: { token: 'a_b', view_type: 1 } },
+  ];
+  const client = fakeClient({ 'GET .*/blocks/T$': () => ({ block: { children: [] } }), 'POST .*/descendant': () => ({}) });
+  await writeDocx({ client, documentId: 'T', content: { blocks }, assets: new Map(), linkFor: () => null, warn: () => {} });
+  const sent = client.calls.find((c) => c.path.endsWith('/descendant')).body.descendants[0];
+  assert.equal(sent.block_type, 2);
+});
+
+test('docx: a rejected table falls back to one line per row', async () => {
+  const cellIds = ['c0', 'c1', 'c2', 'c3'];
+  const blocks = [
+    { block_id: 'doc', block_type: 1, children: ['t'], page: {} },
+    { block_id: 't', block_type: 31, children: cellIds, table: { property: { row_size: 2, column_size: 2 } } },
+    ...cellIds.flatMap((id) => [
+      { block_id: id, block_type: 32, table_cell: {}, children: [`${id}t`] },
+      { block_id: `${id}t`, block_type: 2, text: { elements: [{ text_run: { content: id } }] } },
+    ]),
+  ];
+  const client = rejectingClient((block) => block.block_type === 31);
+  await writeDocx({ client, documentId: 'T', content: { blocks }, assets: new Map(), linkFor: () => null, warn: () => {} });
+  const lines = client.accepted.flatMap((c) => c.blocks).map((b) => b.text.elements[0].text_run.content);
+  assert.deepEqual(lines, ['c0 | c1', 'c2 | c3']);
 });

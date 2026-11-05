@@ -261,7 +261,8 @@ export class LarkClient {
 function toApiError(payload, status, path) {
   const violations = payload.error?.permission_violations || [];
   const scopes = violations.map((v) => v.subject);
-  let message = `${payload.msg || '接口错误'} (code=${payload.code}, ${path})`;
+  const fields = (payload.error?.field_violations || []).map((v) => `${v.field}: ${v.description}`).join('; ');
+  let message = `${payload.msg || '接口错误'}${fields ? ` [${fields}]` : ''} (code=${payload.code}, ${path})`;
   if (scopes.length) message = `机器人缺少权限，需要以下任一权限: ${scopes.join(', ')} (${path})`;
   return new LarkApiError(message, {
     code: payload.code,
