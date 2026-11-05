@@ -94,3 +94,24 @@ test('code 131001 is resent only when it says it was rate limited', async () => 
   await assert.rejects(client.post('/wiki/v2/spaces/s/nodes', {}), /rpc fail/);
   assert.equal(calls, 3);
 });
+
+test('a permission error names the bot that was refused, and other errors do not', async () => {
+  const client = new LarkClient({ appId: 'cli_target', appSecret: 's', apiBase: 'https://example.test' });
+  const answers = [
+    Response.json({ code: 131006, msg: 'permission denied: node permission denied, tenant needs read permission.' }, { status: 400 }),
+    Response.json({ code: 99991672, msg: 'no scope', error: { permission_violations: [{ subject: 'wiki:wiki' }] } }, { status: 400 }),
+    Response.json({ code: 1770002, msg: 'not found' }, { status: 400 }),
+  ];
+  globalThis.fetch = async (input) => {
+    if (String(input).endsWith('tenant_access_token/internal')) return Response.json({ code: 0, tenant_access_token: 't', expire: 7200 });
+    return answers.shift();
+  };
+  await assert.rejects(client.get('/wiki/v2/spaces/get_node'), (err) => {
+    assert.match(err.message, /code=131006/);
+    assert.match(err.message, /App ID: cli_target/);
+    assert.equal(err.code, 131006);
+    return true;
+  });
+  await assert.rejects(client.get('/wiki/v2/spaces/get_node'), /wiki:wiki.*App ID: cli_target/);
+  await assert.rejects(client.get('/docx/v1/documents/x'), (err) => !err.message.includes('App ID'));
+});

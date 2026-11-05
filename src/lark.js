@@ -185,7 +185,7 @@ export class LarkClient {
         await sleep(Math.min(1000 * 2 ** attempt, 15000));
         continue;
       }
-      throw toApiError(payload, res.status, path);
+      throw toApiError(payload, res.status, path, this.appId);
     }
   }
 
@@ -221,7 +221,7 @@ export class LarkClient {
     const contentType = res.headers.get('content-type') || '';
     if (contentType.includes('application/json')) {
       const payload = await res.json();
-      throw toApiError(payload, res.status, path);
+      throw toApiError(payload, res.status, path, this.appId);
     }
     if (!res.ok) throw new LarkApiError(`下载失败 HTTP ${res.status}: ${path}`, { status: res.status });
     const disposition = res.headers.get('content-disposition') || '';
@@ -277,12 +277,17 @@ export class LarkClient {
   }
 }
 
-function toApiError(payload, status, path) {
+// appId is unset for a client acting as a member, whose own access is what counts.
+function toApiError(payload, status, path, appId) {
   const violations = payload.error?.permission_violations || [];
   const scopes = violations.map((v) => v.subject);
   const fields = (payload.error?.field_violations || []).map((v) => `${v.field}: ${v.description}`).join('; ');
   let message = `${payload.msg || '接口错误'}${fields ? ` [${fields}]` : ''} (code=${payload.code}, ${path})`;
   if (scopes.length) message = `机器人缺少权限，需要以下任一权限: ${scopes.join(', ')} (${path})`;
+  // Source and target bots look alike from here, and which one was refused decides the fix.
+  if (appId && (scopes.length || /permission|forbidden/i.test(payload.msg ?? ''))) {
+    message += `。当前使用的机器人 App ID: ${appId}，请确认它有权限访问这个文档`;
+  }
   return new LarkApiError(message, {
     code: payload.code,
     status,
