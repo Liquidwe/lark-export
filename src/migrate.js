@@ -8,7 +8,9 @@ import { appConfig, clientFor, concurrencyFromEnv, documentHost, limiter, mapCon
 import { writeBitable } from './bitable-writer.js';
 import { writeDocx } from './docx-writer.js';
 
-const URL_TOKEN = /\/(?:wiki|docx|docs|sheets|base|bitable|file|mindnote|slides)\/([A-Za-z0-9]+)/;
+const URL_TOKEN = /\/(?:wiki|docx|docs|sheets|base|bitable|file|mindnote|slides|drive\/folder)\/([A-Za-z0-9]+)/;
+// Where each type lives outside the wiki, as in a Drive file's own address.
+const DRIVE_PATHS = { docx: 'docx', doc: 'docs', sheet: 'sheets', bitable: 'base', file: 'file', folder: 'drive/folder', mindnote: 'mindnote', slides: 'slides' };
 const MY_LIBRARY = 'my_library';
 const TITLE_ATTEMPTS = 5;
 const TITLE_SETTLE_MS = 2000;
@@ -348,6 +350,7 @@ async function confirmRootTitle(ctx) {
 function createStep(node) {
   if (node.status === 'done' && node.obj_type === 'sheet') return '导入电子表格';
   if (node.status === 'done' && node.obj_type === 'file') return '上传文件';
+  if (node.obj_type === 'folder') return '新建文件夹';
   return '新建节点';
 }
 
@@ -391,8 +394,10 @@ async function createNode(ctx, node, item) {
     item.target_node_token = ctx.target.node_token;
     return;
   }
-  const parent = parentOf(ctx, node);
+  const inDrive = node.space === 'drive';
+  const parent = inDrive && node.parent_token === null ? await targetDriveRoot(ctx) : parentOf(ctx, node);
   const createWiki = async (objType, extra = {}) => {
+    if (inDrive) return createInFolder(ctx, objType, node.title, parent);
     const { node: created } = await ctx.client.post(`/wiki/v2/spaces/${ctx.spaceId}/nodes`, {
       obj_type: objType,
       node_type: 'origin',
@@ -412,10 +417,14 @@ async function createNode(ctx, node, item) {
         .prepare('SELECT target_node_token FROM migration_items WHERE migration_id = ? AND node_id = ?')
         .get(ctx.job.id, origin.id);
       if (!originToken) throw new Error(`快捷方式的原文档「${origin.title}」未创建成功`);
-      created = await createWiki(origin.obj_type, { node_type: 'shortcut', origin_node_token: originToken });
+      created = inDrive
+        ? await createDriveShortcut(ctx, origin, parent)
+        : await createWiki(origin.obj_type, { node_type: 'shortcut', origin_node_token: originToken });
     } else {
       created = await createWiki('docx');
     }
+  } else if (node.obj_type === 'folder') {
+    created = await createWiki('folder');
   } else if (node.status === 'done' && node.obj_type === 'bitable') {
     created = await createWiki('bitable');
   } else if (node.status === 'done' && node.obj_type === 'sheet') {
@@ -427,7 +436,7 @@ async function createNode(ctx, node, item) {
     } catch (err) {
       created = await createWiki('docx');
       const reason = `文件上传失败: ${err.message}`;
-      await writePlaceholder(ctx, { target_obj_token: created.obj_token }, `${reason}。原始文档: ${ctx.source.host}/wiki/${node.node_token}`);
+      await writePlaceholder(ctx, { target_obj_token: created.obj_token }, `${reason}。原始文档: ${sourceLink(ctx, node)}`);
       fallback = { status: 'placeholder', warnings: JSON.stringify([reason]) };
     }
   } else {
@@ -460,7 +469,7 @@ async function importSheet(ctx, node, parent) {
     file_token: fileToken,
     type: 'sheet',
     file_name: node.title,
-    point: { mount_type: 1, mount_key: '' },
+    point: { mount_type: 1, mount_key: node.space === 'drive' ? parent : '' },
   });
   let imported;
   for (let attempt = 0; attempt < 120 && !imported; attempt++) {
@@ -471,21 +480,60 @@ async function importSheet(ctx, node, parent) {
     } else await pollDelay(attempt);
   }
   if (!imported) throw new Error('表格导入超时');
+  if (node.space === 'drive') return { node_token: imported, obj_token: imported, obj_type: 'sheet' };
   return moveToWiki(ctx, 'sheet', imported, parent);
 }
 
 async function uploadFile(ctx, node, parent) {
   const asset = ctx.assets.get(node.id)?.get(`file:${node.obj_token}`);
   if (!asset) throw new Error('本地没有这个文件');
-  const { token: rootFolder } = await ctx.client.get('/drive/explorer/v2/root_folder/meta');
+  const inDrive = node.space === 'drive';
+  const folder = inDrive ? parent : (await ctx.client.get('/drive/explorer/v2/root_folder/meta')).token;
   const fileToken = await ctx.client.upload({
     api: 'files',
     buffer: readFileSync(asset.path),
     fileName: asset.file_name || node.title,
     parentType: 'explorer',
-    parentNode: rootFolder,
+    parentNode: folder,
   });
+  if (inDrive) return { node_token: fileToken, obj_token: fileToken, obj_type: 'file' };
   return moveToWiki(ctx, 'file', fileToken, parent);
+}
+
+// Drive items are addressed by their own token, so node and object token are the same.
+async function createInFolder(ctx, objType, title, folder) {
+  if (objType === 'folder') {
+    const { token } = await ctx.client.post('/drive/v1/files/create_folder', { name: title || '未命名文件夹', folder_token: folder });
+    return { node_token: token, obj_token: token, obj_type: 'folder' };
+  }
+  if (objType === 'bitable') {
+    const { app } = await ctx.client.post('/bitable/v1/apps', { name: title, folder_token: folder });
+    return { node_token: app.app_token, obj_token: app.app_token, obj_type: 'bitable' };
+  }
+  const { document } = await ctx.client.post('/docx/v1/documents', { title, folder_token: folder });
+  return { node_token: document.document_id, obj_token: document.document_id, obj_type: 'docx' };
+}
+
+async function createDriveShortcut(ctx, origin, folder) {
+  const { target_obj_token: refer, target_obj_type: type } = db
+    .prepare('SELECT target_obj_token, target_obj_type FROM migration_items WHERE migration_id = ? AND node_id = ?')
+    .get(ctx.job.id, origin.id);
+  const { succ_shortcut_node: shortcut } = await ctx.client.post('/drive/v1/files/create_shortcut', {
+    parent_token: folder,
+    refer_entity: { refer_token: refer, refer_type: type },
+  });
+  return { node_token: shortcut.token, obj_token: refer, obj_type: type };
+}
+
+// The new account's Drive root, where the migrated "My Space" folder goes. Asked once per run.
+function targetDriveRoot(ctx) {
+  ctx.driveRoot ??= ctx.client.get('/drive/explorer/v2/root_folder/meta').then((meta) => meta.token);
+  return ctx.driveRoot;
+}
+
+function sourceLink(ctx, node, token = node.node_token) {
+  const path = node.space === 'drive' ? DRIVE_PATHS[node.obj_type] ?? 'file' : 'wiki';
+  return `${ctx.source.host}/${path}/${token}`;
 }
 
 async function moveToWiki(ctx, objType, objToken, parent) {
@@ -516,22 +564,28 @@ async function moveToWiki(ctx, objType, objToken, parent) {
 function buildLinkMapper(ctx) {
   const rows = db
     .prepare(
-      `SELECT n.node_token, n.obj_token, i.target_node_token
+      `SELECT n.node_token, n.obj_token, n.space, i.target_node_token, i.target_obj_token, i.target_obj_type
        FROM migration_items i JOIN nodes n ON n.id = i.node_id
        WHERE i.migration_id = ? AND i.target_node_token IS NOT NULL`,
     )
     .all(ctx.job.id);
-  const tokens = new Map();
+  const urls = new Map();
   for (const row of rows) {
-    tokens.set(row.node_token, row.target_node_token);
-    if (row.obj_token) tokens.set(row.obj_token, row.target_node_token);
+    const url = migratedUrl(ctx.job.target_host, row);
+    urls.set(row.node_token, url);
+    if (row.obj_token) urls.set(row.obj_token, url);
   }
   return (url) => {
     const match = url.match(URL_TOKEN);
-    if (!match) return null;
-    const mapped = tokens.get(match[1]);
-    return mapped ? `${ctx.job.target_host}/wiki/${mapped}` : null;
+    return match ? (urls.get(match[1]) ?? null) : null;
   };
+}
+
+// Where a migrated node can be opened: its wiki node, or for Drive the file's own address.
+export function migratedUrl(host, { space, target_node_token, target_obj_token, target_obj_type }) {
+  if (!target_node_token) return null;
+  if (space === 'drive') return `${host}/${DRIVE_PATHS[target_obj_type] ?? 'file'}/${target_obj_token}`;
+  return `${host}/wiki/${target_node_token}`;
 }
 
 async function fillNode(ctx, node, item, linkFor, progress) {
@@ -547,7 +601,7 @@ async function fillNode(ctx, node, item, linkFor, progress) {
   if (node.node_type === 'shortcut') {
     // A shortcut whose origin was migrated is already complete; otherwise createNode made a docx stand-in.
     if (!ctx.nodes.some((n) => n.node_token === node.origin_node_token)) {
-      const url = `${ctx.source.host}/wiki/${node.origin_node_token}`;
+      const url = sourceLink(ctx, node, node.origin_node_token);
       await writePlaceholder(ctx, item, `此快捷方式指向迁移范围之外的文档: ${url}`);
       warn('快捷方式指向迁移范围之外的文档，已替换为说明文档');
     }
@@ -565,7 +619,7 @@ async function fillNode(ctx, node, item, linkFor, progress) {
     await writeBitable({ client: ctx.client, appToken: item.target_obj_token, content, assets, warn, progress });
   } else if (node.status !== 'done') {
     progress('写入占位文档');
-    const url = `${ctx.source.host}/wiki/${node.node_token}`;
+    const url = sourceLink(ctx, node);
     const reason = node.status === 'unsupported' ? `暂不支持迁移 ${node.obj_type} 类型` : `读取失败: ${node.error}`;
     await writePlaceholder(ctx, item, `${reason}。原始文档: ${url}`);
     warn(reason);

@@ -35,9 +35,9 @@ after(async () => {
 
 const ok = (data) => Response.json({ code: 0, data });
 
-// A fake Lark with one library per organization. Requests to this server pass through.
+// A fake Lark with one library and one Drive per organization. Requests to this server pass through.
 beforeEach(() => {
-  lark = { tokens: [], created: [], tokenUses: [], refreshes: 0, expiresIn: 7200 };
+  lark = { tokens: [], created: [], folders: [], docs: [], tokenUses: [], refreshes: 0, expiresIn: 7200 };
   globalThis.fetch = async (input, init = {}) => {
     const url = new URL(String(input));
     if (url.origin === base) return realFetch(input, init);
@@ -71,6 +71,25 @@ beforeEach(() => {
       const body = JSON.parse(init.body);
       lark.created.push(body);
       return ok({ node: { node_token: `n-${body.title}`, obj_token: `d-${lark.created.length}`, obj_type: 'docx' } });
+    }
+    if (path === '/drive/explorer/v2/root_folder/meta') return ok({ token: auth.includes('target') ? 'drv-new' : 'drv-old' });
+    if (path === '/drive/v1/files') {
+      const folder = url.searchParams.get('folder_token');
+      const files = {
+        'drv-old': [{ token: 'fd1', name: '资料', type: 'folder', url: 'https://acme.larksuite.com/drive/folder/fd1' }],
+        fd1: [{ token: 'o3', name: '机密三', type: 'docx', url: 'https://acme.larksuite.com/docx/o3' }],
+      }[folder];
+      return ok({ files: files ?? [], has_more: false });
+    }
+    if (path === '/drive/v1/files/create_folder') {
+      const body = JSON.parse(init.body);
+      lark.folders.push([body.name, body.folder_token]);
+      return ok({ token: `f-${body.name}` });
+    }
+    if (path === '/docx/v1/documents' && init.method === 'POST') {
+      const body = JSON.parse(init.body);
+      lark.docs.push([body.title, body.folder_token]);
+      return ok({ document: { document_id: `dd-${body.title}` } });
     }
     if (/\/documents\/o\d\/blocks$/.test(path)) return ok({ items: [{ block_id: 'p', block_type: 1, children: [] }], has_more: false });
     return ok({ block: { children: [] }, items: [], has_more: false });
@@ -181,7 +200,14 @@ test('members cannot use links or reach admin routes', async () => {
 test('a member reads the whole library with their own token, and others cannot touch it', async () => {
   const alice = await signIn('alice');
   const job = await readLibrary(alice);
-  assert.deepEqual(job.nodes.map((n) => [n.title, n.parent_token]), [['机密一', null], ['机密二', null]]);
+  assert.deepEqual(job.nodes.map((n) => [n.title, n.parent_token]), [
+    ['机密一', null],
+    ['机密二', null],
+    ['我的空间', null],
+    ['资料', 'drv-old'],
+    ['机密三', 'fd1'],
+  ]);
+  assert.equal(job.nodes.find((n) => n.title === '机密三').status, 'done');
   assert.equal(job.host, 'https://acme.larksuite.com');
   assert.ok(lark.tokenUses.every(([, auth]) => auth.includes('user-alice')), 'never the bot');
 
@@ -205,7 +231,7 @@ test('the admin sees member status but no titles, errors or tokens', async () =>
   const res = await admin.call('/api/admin/members');
   const text = await res.text();
   const row = JSON.parse(text).find((member) => member.name === 'alice');
-  assert.equal(row.read.total, 2);
+  assert.equal(row.read.total, 5);
   assert.doesNotMatch(text, /机密|我的文档库|node_token|access_token|ou_/);
 });
 
@@ -232,6 +258,10 @@ test('a member writes to their new library only after authorizing it, at the top
   }
   assert.equal(migration.status, 'done', migration.error);
   assert.deepEqual(lark.created.map((body) => [body.title, body.parent_node_token]), [['机密一', undefined], ['机密二', undefined]]);
+  // My Space becomes one folder in the new Drive root, with its own folders and files inside.
+  assert.deepEqual(lark.folders, [['我的空间', 'drv-new'], ['资料', 'f-我的空间']]);
+  assert.deepEqual(lark.docs, [['机密三', 'f-资料']]);
+  assert.equal(migration.items.find((item) => item.title === '机密三').url, 'https://acme.larksuite.com/docx/dd-机密三');
   assert.ok(lark.tokenUses.every(([, auth]) => auth.includes('user-target')), 'writes use the new account');
   assert.equal(migration.target_host, 'https://acme.larksuite.com');
   assert.match(migration.items[0].url, /^https:\/\/acme\.larksuite\.com\/wiki\/n-/);

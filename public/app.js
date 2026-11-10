@@ -14,6 +14,7 @@ const TYPE_LABELS = {
   sheet: '电子表格',
   bitable: '多维表格',
   file: '文件',
+  folder: '文件夹',
   mindnote: '思维笔记',
   slides: '幻灯片',
 };
@@ -151,10 +152,10 @@ function showLogin() {
   renderInPlace(`
     <section class="login">
       <h1>Lark 文档迁移</h1>
-      <p class="sub">把你的文档库迁移到新组织，目录结构保持不变。</p>
+      <p class="sub">把你的文档库和云空间迁移到新组织，目录结构保持不变。</p>
       ${code && LOGIN_ERRORS[code] ? `<p class="error">${esc(LOGIN_ERRORS[code])}</p>` : ''}
       ${me?.memberEnabled === false ? '<p class="hint">管理员还没有配置 Lark 机器人。</p>' : '<a class="button wide" href="/api/auth/lark/login">使用 Lark 账号登录</a>'}
-      <p class="hint">登录后，工具只能读取你本人的文档库。</p>
+      <p class="hint">登录后，工具只能读取你本人的文档库和云空间（我的空间）。</p>
       ${me?.adminEnabled ? `
         <form id="admin-login" class="admin-login">
           <label for="admin-password">管理员登录</label>
@@ -324,12 +325,12 @@ function step(number, title, state, body) {
 
 function readStep(job) {
   if (!job) {
-    return step(1, '读取我的文档库', 'current', `
-      <p class="hint">读取你在当前组织的整个文档库，内容会暂存在这台服务器上。不会修改原文档。</p>
+    return step(1, '读取我的文档库和云空间', 'current', `
+      <p class="hint">读取你在当前组织的整个文档库，以及云空间“我的空间”里的文件夹和文件，内容会暂存在这台服务器上。不会修改原文档。</p>
       <div class="actions"><button data-action="start-library">开始读取</button></div>`);
   }
   const finished = !isActive(job.status) && job.tree_complete && !job.byStatus.pending && !job.byStatus.reading;
-  return step(1, '读取我的文档库', finished ? 'done' : 'current', `
+  return step(1, '读取我的文档库和云空间', finished ? 'done' : 'current', `
     <div class="spread"><span class="hint-inline">${esc(formatTime(job.created_at))}</span>${badge(job.status)}</div>
     ${job.error ? `<p class="error">${esc(job.error)}</p>` : ''}
     ${readSummary(job)}
@@ -351,7 +352,7 @@ function authorizeStep() {
       </div>`);
   }
   return step(2, '授权新组织', 'current', `
-    <p class="hint">用你在新组织的 Lark 账号登录，内容会写到这个账号的文档库。</p>
+    <p class="hint">用你在新组织的 Lark 账号登录，内容会写到这个账号的文档库和云空间。</p>
     <div class="actions"><a class="button" href="/api/auth/lark/target">授权新组织</a></div>`);
 }
 
@@ -361,7 +362,7 @@ function writeStep(job) {
   const ready = finished && me.target && !migrating;
   const done = job?.migrations[0]?.status === 'done';
   return step(3, '写入新组织', done ? 'done' : ready ? 'current' : 'waiting', `
-    <p class="hint">内容会写到${me.target ? `「${esc(me.target.name)}」` : '你'}在新组织的文档库顶层，不会覆盖已有内容。</p>
+    <p class="hint">内容会写到${me.target ? `「${esc(me.target.name)}」` : '你'}在新组织的文档库顶层；云空间的内容放在新账号云空间里一个名为“我的空间”的文件夹中。不会覆盖已有内容。</p>
     ${draft.error ? `<p class="error">${esc(draft.error)}</p>` : ''}
     <div class="actions"><button data-action="start-library-migration" ${ready ? '' : 'disabled'}>${job?.migrations.length ? '再次写入' : '开始写入'}</button></div>
     ${(job?.migrations ?? []).map(migrationBlock).join('')}`);
@@ -373,7 +374,7 @@ async function showMemberHome(requestedId) {
   const job = id ? await api(`/api/exports/${id}`) : null;
   const older = jobs.filter((other) => other.id !== job?.id);
   renderInPlace(`
-    <h1>迁移我的文档库</h1>
+    <h1>迁移我的文档库和云空间</h1>
     <p class="sub">按顺序完成下面三步。</p>
     ${readStep(job)}
     ${authorizeStep()}
@@ -451,7 +452,7 @@ const ACTIONS = {
   'start-library-migration': async ({ exportId }) => {
     const job = await api(`/api/exports/${exportId}`);
     const lines = [
-      `将把 ${job.total} 个节点写到「${me.target.name}」在新组织的文档库顶层。`,
+      `将把 ${job.total} 个节点写到「${me.target.name}」在新组织的文档库和云空间。`,
       '已有内容不会被覆盖。',
     ];
     if (job.migrations.length) lines.push('这份内容已经写入过，再次写入会产生重复的文档。');
@@ -611,7 +612,7 @@ function migrationBlock(m) {
   const root = m.items.find((item) => item.url);
   const destination = m.target_url
     ? `<a href="${esc(m.target_url)}" target="_blank" rel="noreferrer">${esc(m.target_url)}</a>`
-    : '新组织的文档库';
+    : '新组织的文档库和云空间';
   return `
     <div class="migration">
       <div class="spread">

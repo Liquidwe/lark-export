@@ -21,6 +21,7 @@ import {
 import { db, parseJson } from './db.js';
 import { deleteExport, pauseExport, resumeExport, retryNode, startExport, startLibraryExport } from './extract.js';
 import {
+  migratedUrl,
   migrationProgress,
   pauseMigration,
   previewMigration,
@@ -92,7 +93,7 @@ function migrationDetail(id) {
   if (!job) return null;
   const items = db
     .prepare(
-      `SELECT i.node_id, i.status, i.error, i.warnings, i.target_node_token, i.duration_ms, n.title, n.obj_type, n.depth
+      `SELECT i.node_id, i.status, i.error, i.warnings, i.target_node_token, i.target_obj_token, i.target_obj_type, i.duration_ms, n.title, n.obj_type, n.depth, n.space
        FROM migration_items i JOIN nodes n ON n.id = i.node_id
        WHERE i.migration_id = ? ORDER BY n.position`,
     )
@@ -100,7 +101,7 @@ function migrationDetail(id) {
     .map((item) => ({
       ...item,
       warnings: parseJson(item.warnings, []),
-      url: item.target_node_token ? `${job.target_host}/wiki/${item.target_node_token}` : null,
+      url: migratedUrl(job.target_host, item),
     }));
   return { ...job, counts: countItems(items), items, progress: migrationProgress(job, items) };
 }

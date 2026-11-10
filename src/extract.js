@@ -1,4 +1,4 @@
-// Reads a wiki subtree into the local database and blob directory.
+// Reads a wiki subtree, or a member's library and Drive, into the local database and blob directory.
 
 import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -18,6 +18,7 @@ const BITABLE_ATTACHMENT = 17;
 const MAX_EMBED_ROWS = 101;
 const MAX_EMBED_COLUMNS = 101;
 const MY_LIBRARY = 'my_library';
+const MY_DRIVE_TITLE = '我的空间';
 
 export function startExport(sourceUrl) {
   const { host, token, apiBase } = parseWikiUrl(sourceUrl);
@@ -32,7 +33,7 @@ export function startExport(sourceUrl) {
   return id;
 }
 
-// Reads everything in the member's own library. There is no link: the library is theirs by login.
+// Reads everything in the member's own library and Drive. There is no link: both are theirs by login.
 export function startLibraryExport(ownerId) {
   const running = db
     .prepare(`SELECT id FROM exports WHERE owner_id = ? AND status IN ('running', 'pausing') LIMIT 1`)
@@ -154,12 +155,15 @@ async function runExport(id) {
 }
 
 async function readTree(client, job) {
-  const roots = job.owner_id === null ? [await linkedRoot(client, job)] : await libraryRoots(client, job);
+  const roots =
+    job.owner_id === null
+      ? [fromWiki(await linkedRoot(client, job))]
+      : [...(await libraryRoots(client, job)).map(fromWiki), await driveRoot(client)];
 
   const insert = db.prepare(
     `INSERT INTO nodes (export_id, node_token, parent_token, obj_token, obj_type, node_type,
-                        origin_node_token, title, depth, position)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                        origin_node_token, title, depth, position, space)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   );
   let discovered = 0;
   const record = (node, parentToken, depth) =>
@@ -170,10 +174,11 @@ async function readTree(client, job) {
       node.obj_token,
       node.obj_type,
       node.node_type,
-      node.origin_node_token ?? null,
+      node.origin_node_token,
       node.title,
       depth,
       discovered++,
+      node.space,
     );
 
   // Walked level by level so siblings can be listed in parallel. Rows go in as they are
@@ -182,13 +187,10 @@ async function readTree(client, job) {
   const childrenOf = new Map();
   let level = roots;
   for (let depth = 1; level.length; depth++) {
-    const parents = level.filter((node) => node.has_child);
+    const parents = level.filter((node) => node.hasChildren);
     const next = [];
     await mapConcurrent(parents, readConcurrency(), async (parent) => {
-      const children = await client.all(`/wiki/v2/spaces/${parent.space_id}/nodes`, {
-        parent_node_token: parent.node_token,
-        page_size: 50,
-      });
+      const children = await listChildren(client, parent);
       childrenOf.set(parent.node_token, children);
       for (const child of children) {
         record(child, parent.node_token, depth);
@@ -196,6 +198,12 @@ async function readTree(client, job) {
       }
     });
     level = next;
+  }
+
+  // A member with nothing in the library has no wiki node to learn the address from.
+  const driveFile = [...childrenOf.values()].flat().find((node) => node.space === 'drive' && node.url);
+  if (!roots.some((root) => root.space === 'wiki') && driveFile) {
+    db.prepare('UPDATE exports SET host = ? WHERE id = ?').run(new URL(driveFile.url).origin, job.id);
   }
 
   const setPosition = db.prepare('UPDATE nodes SET position = ? WHERE export_id = ? AND node_token = ?');
@@ -212,6 +220,71 @@ async function readTree(client, job) {
     db.exec('ROLLBACK');
     throw err;
   }
+}
+
+// Wiki nodes and Drive files are stored alike. A node's token is what its children point to.
+function fromWiki(node) {
+  return {
+    space: 'wiki',
+    node_token: node.node_token,
+    obj_token: node.obj_token,
+    obj_type: node.obj_type,
+    node_type: node.node_type,
+    origin_node_token: node.origin_node_token ?? null,
+    title: node.title,
+    hasChildren: node.has_child,
+    spaceId: node.space_id,
+  };
+}
+
+// A Drive shortcut has its own token and points to another file, much like a wiki shortcut.
+function fromDrive(file) {
+  const shortcut = file.type === 'shortcut' ? file.shortcut_info : null;
+  return {
+    space: 'drive',
+    node_token: file.token,
+    obj_token: shortcut ? shortcut.target_token : file.token,
+    obj_type: shortcut ? shortcut.target_type : file.type,
+    node_type: shortcut ? 'shortcut' : 'origin',
+    origin_node_token: shortcut?.target_token ?? null,
+    title: file.name,
+    hasChildren: file.type === 'folder',
+    url: file.url,
+  };
+}
+
+async function listChildren(client, parent) {
+  if (parent.space === 'wiki') {
+    const children = await client.all(`/wiki/v2/spaces/${parent.spaceId}/nodes`, {
+      parent_node_token: parent.node_token,
+      page_size: 50,
+    });
+    return children.map(fromWiki);
+  }
+  // Drive pages with next_page_token rather than page_token, so client.all does not fit.
+  const files = [];
+  let pageToken;
+  do {
+    const data = await client.get('/drive/v1/files', { folder_token: parent.node_token, page_size: 200, page_token: pageToken });
+    files.push(...(data.files ?? []));
+    pageToken = data.has_more ? data.next_page_token : undefined;
+  } while (pageToken);
+  return files.map(fromDrive);
+}
+
+// The member's own Drive ("My Space") becomes one more root, holding its folders and files.
+async function driveRoot(client) {
+  const { token } = await client.get('/drive/explorer/v2/root_folder/meta');
+  return {
+    space: 'drive',
+    node_token: token,
+    obj_token: token,
+    obj_type: 'folder',
+    node_type: 'origin',
+    origin_node_token: null,
+    title: MY_DRIVE_TITLE,
+    hasChildren: true,
+  };
 }
 
 async function linkedRoot(client, job) {
@@ -232,7 +305,7 @@ async function libraryRoots(client, job) {
 async function readNode(client, job, node) {
   const saved = (kind, token, buffer, fileName) => saveAsset(job.id, node, kind, token, buffer, fileName);
   let result;
-  if (node.node_type === 'shortcut') {
+  if (node.node_type === 'shortcut' || node.obj_type === 'folder') {
     result = { stats: {}, warnings: [] };
   } else if (node.obj_type === 'docx') {
     result = await readDocx(client, node, saved);

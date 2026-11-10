@@ -126,6 +126,8 @@ addColumn('migrations', 'active_ms', 'INTEGER NOT NULL DEFAULT 0');
 addColumn('migration_items', 'duration_ms', 'INTEGER NOT NULL DEFAULT 0');
 // NULL means the admin, which also covers records from before there were members.
 addColumn('exports', 'owner_id', 'INTEGER REFERENCES users(id)');
+// Where a node lives: a wiki space, or a member's Drive folders.
+addColumn('nodes', 'space', "TEXT NOT NULL DEFAULT 'wiki'");
 
 // A restart kills in-process jobs, so anything still "running" can never finish on its own.
 db.exec(`
