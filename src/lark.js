@@ -28,6 +28,9 @@ const SINGLE_UPLOAD_LIMIT = 20 * 1024 * 1024;
 // 131009 is a lock on the wiki tree, seen when nodes are created too quickly.
 const RATE_LIMIT_CODES = new Set([99991400, 1254290]);
 const RETRYABLE_CODES = new Set([...RATE_LIMIT_CODES, 1770064, 90217, 131009]);
+// Lark-side hiccups that pass on a second try. Only reads are resent, since nothing says a write was refused.
+// 600 "expired resource deleted by ka" came up across hundreds of document reads and cleared on retry.
+const TRANSIENT_READ_CODES = new Set([600]);
 
 export class LarkApiError extends Error {
   constructor(message, { code, status, scopes, logId } = {}) {
@@ -180,7 +183,8 @@ export class LarkClient {
       if (payload.code === 0) return payload.data ?? {};
       // 131001 is a generic failure that may have applied, so only its rate-limit form is resent.
       const rateLimited = RATE_LIMIT_CODES.has(payload.code) || (payload.code === 131001 && /rate limit/i.test(payload.msg));
-      if ((rateLimited || RETRYABLE_CODES.has(payload.code)) && attempt < MAX_RETRIES) {
+      const transient = method === 'GET' && TRANSIENT_READ_CODES.has(payload.code);
+      if ((rateLimited || transient || RETRYABLE_CODES.has(payload.code)) && attempt < MAX_RETRIES) {
         if (rateLimited) this.pauseGroup(method, path, res);
         await sleep(Math.min(1000 * 2 ** attempt, 15000));
         continue;

@@ -115,3 +115,18 @@ test('a permission error names the bot that was refused, and other errors do not
   await assert.rejects(client.get('/wiki/v2/spaces/get_node'), /wiki:wiki.*App ID: cli_target/);
   await assert.rejects(client.get('/docx/v1/documents/x'), (err) => !err.message.includes('App ID'));
 });
+
+test('a transient Lark error (600) is resent on reads, but not on writes', async () => {
+  const answers = [{ code: 600, msg: 'expired resource deleted by ka' }, { code: 0, data: { ok: true } }];
+  let calls = 0;
+  globalThis.fetch = async (url) => {
+    if (String(url).includes('tenant_access_token')) return Response.json({ code: 0, tenant_access_token: 't', expire: 7200 });
+    return Response.json(answers[Math.min(calls++, answers.length - 1)]);
+  };
+  assert.deepEqual(await client().get('/docx/v1/documents/d/blocks'), { ok: true });
+  assert.equal(calls, 2);
+
+  calls = 0;
+  await assert.rejects(client().post('/x', {}), /expired resource/);
+  assert.equal(calls, 1);
+});

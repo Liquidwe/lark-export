@@ -11,6 +11,35 @@ const PLACEHOLDER = placeholderText(ADDON_LABEL);
 const ADD_ON = 40;
 const readConcurrency = () => concurrencyFromEnv('READ_CONCURRENCY', 8, 32);
 const writeConcurrency = () => concurrencyFromEnv('WRITE_CONCURRENCY', 6, 16);
+// Documents that still fail get this many more rounds, slower and fewer at a time,
+// since most failures over hundreds of documents are passing ones on Lark's side.
+const RETRY_ROUNDS = 2;
+const RETRY_CONCURRENCY = 2;
+const retryDelay = () => concurrencyFromEnv('REPAIR_RETRY_DELAY_MS', 5000, 600000);
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Runs work over items, then again over the ones that threw, until none are left or the rounds run out.
+async function withRetryRounds(items, concurrency, work, { onRetry = () => {}, onGiveUp }) {
+  let pending = items;
+  for (let round = 0; pending.length; round++) {
+    const last = round === RETRY_ROUNDS;
+    if (round) {
+      onRetry(pending.length, round);
+      await sleep(retryDelay() * round);
+    }
+    const failed = [];
+    await mapConcurrent(pending, round ? RETRY_CONCURRENCY : concurrency, async (item) => {
+      try {
+        await work(item);
+      } catch (err) {
+        if (last) onGiveUp(item, err);
+        else failed.push(item);
+      }
+    });
+    if (last) break;
+    pending = failed;
+  }
+}
 
 // Compares two trees and lists the documents whose diagrams are missing. Nothing is written.
 export function startRepair(sourceUrl, targetUrl) {
@@ -95,20 +124,32 @@ async function scan(id, sourceLink, targetLink) {
   }
 
   const documents = pairs.filter((pair) => pair.source.obj_type === 'docx' && pair.target.obj_type === 'docx');
-  await mapConcurrent(documents, readConcurrency(), async (pair) => {
-    try {
+  await withRetryRounds(
+    documents,
+    readConcurrency(),
+    async (pair) => {
       const sourceBlocks = inOrder(await blocksOf(source, pair.source.obj_token));
       const diagrams = sourceBlocks.filter((block) => block.block_type === ADD_ON);
       if (diagrams.length) {
         const { slots } = await slotsOf(target, pair.target.obj_token);
         docs.push(describe(pair, sourceLink.host, targetLink.host, diagrams, slots));
       }
-    } catch (err) {
-      docs.push({ ...docOf(pair, sourceLink.host, targetLink.host), state: 'failed', error: err.message });
-    }
-    progress.checked++;
-    save();
-  });
+      progress.checked++;
+      save();
+    },
+    {
+      onRetry: (count, round) => {
+        progress.retrying = { count, round };
+        save();
+      },
+      onGiveUp: (pair, err) => {
+        docs.push({ ...docOf(pair, sourceLink.host, targetLink.host), state: 'failed', error: err.message });
+        progress.checked++;
+        save();
+      },
+    },
+  );
+  delete progress.retrying;
   docs.sort((a, b) => a.path.localeCompare(b.path, 'zh'));
   save();
   return 'scanned';
@@ -122,7 +163,9 @@ async function apply(id, job, docs) {
   const save = () => db.prepare('UPDATE repairs SET docs = ? WHERE id = ?').run(JSON.stringify(docs), id);
   const todo = docs.filter((doc) => doc.state === 'missing' || doc.state === 'failed');
 
-  await mapConcurrent(todo, writeConcurrency(), async (doc) => {
+  const progress = parseJson(job.progress, {});
+  const saveProgress = () => db.prepare('UPDATE repairs SET progress = ? WHERE id = ?').run(JSON.stringify(progress), id);
+  const fixOne = async (doc) => {
     doc.state = 'applying';
     doc.error = null;
     doc.restored ??= 0;
@@ -147,9 +190,21 @@ async function apply(id, job, docs) {
     } catch (err) {
       doc.state = 'failed';
       doc.error = err.message;
+      save();
+      throw err;
     }
     save();
+  };
+  // Each attempt reads both documents again, so a retry picks up from whatever is already restored.
+  await withRetryRounds(todo, writeConcurrency(), fixOne, {
+    onRetry: (count, round) => {
+      progress.retrying = { count, round };
+      saveProgress();
+    },
+    onGiveUp: () => {},
   });
+  delete progress.retrying;
+  saveProgress();
   return docs.some((doc) => doc.state === 'failed') ? 'partial' : 'done';
 }
 

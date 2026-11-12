@@ -192,6 +192,8 @@ button.link-button.danger:hover:not(:disabled) { color: var(--bad); }
 table td { vertical-align: top; }
 .table-wrap td:first-child { white-space: normal; min-width: 160px; }
 .unmatched { margin-top: 12px; font-size: 13px; }
+.scroll-box { max-height: 420px; overflow: auto; margin-top: 10px; border: 1px solid var(--line); border-radius: 8px; padding: 0 12px; }
+.scroll-box thead th { position: sticky; top: 0; z-index: 1; background: var(--panel); padding-top: 10px; box-shadow: 0 1px 0 var(--line); }
 .unmatched summary { cursor: pointer; color: var(--muted); }
 
 .tiles {

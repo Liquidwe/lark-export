@@ -108,7 +108,15 @@ function renderInPlace(html) {
   const focused = document.activeElement;
   const focusId = focused?.id;
   const caret = focused?.selectionStart;
+  // Scrolled lists and opened sections stay as the user left them.
+  const kept = [...app.querySelectorAll('[data-keep]')].map((el) => [el.dataset.keep, el.scrollTop, el.open]);
   app.innerHTML = html;
+  for (const [key, scrollTop, open] of kept) {
+    const el = app.querySelector(`[data-keep="${CSS.escape(key)}"]`);
+    if (!el) continue;
+    el.scrollTop = scrollTop;
+    if (open !== undefined) el.open = open;
+  }
   if (focusId) {
     const next = document.getElementById(focusId);
     next?.focus();
@@ -272,14 +280,23 @@ async function showRepair() {
   schedule(route, repairs.some((r) => r.status === 'scanning' || r.status === 'applying'));
 }
 
+// Problems first, so they are not lost in a long list.
+const REPAIR_ORDER = { failed: 0, mismatch: 1, applying: 2, missing: 3, fixed: 4, complete: 5 };
+
 function repairPanel(r) {
+  const docs = [...r.docs].sort((a, b) => (REPAIR_ORDER[a.state] ?? 9) - (REPAIR_ORDER[b.state] ?? 9));
+  // A restart leaves the last note behind, so it only shows while the job is really running.
+  const running = r.status === 'scanning' || r.status === 'applying';
+  const retrying = running && r.progress.retrying
+    ? ` · 正在自动重试 ${r.progress.retrying.count} 篇失败的文档（第 ${r.progress.retrying.round} 轮）`
+    : '';
   const sum = (key) => r.docs.reduce((total, doc) => total + (doc[key] ?? 0), 0);
   const byState = (state) => r.docs.filter((doc) => doc.state === state).length;
   const toFix = r.docs.filter((doc) => doc.state === 'missing' || doc.state === 'failed');
   const canApply = (r.status === 'scanned' || r.status === 'partial') && toFix.length;
   const progress = r.status === 'scanning'
     ? `已配对 ${r.progress.paired} 个节点 · 已检查 ${r.progress.checked} 篇文档`
-    : `${r.docs.length} 篇文档有图表，共 ${sum('diagrams')} 张 · 待补 ${sum('missing')} 张 · 已补 ${sum('restored')} 张${byState('mismatch') ? ` · ${byState('mismatch')} 篇需手动处理` : ''}`;
+    : `${r.docs.length} 篇文档有图表，共 ${sum('diagrams')} 张 · 待补 ${sum('missing')} 张 · 已补 ${sum('restored')} 张${byState('mismatch') ? ` · ${byState('mismatch')} 篇需手动处理` : ''}${byState('failed') ? ` · ${byState('failed')} 篇自动重试后仍失败` : ''}`;
   const unmatched = r.progress.unmatched ?? [];
   return `
     <section class="panel">
@@ -292,13 +309,13 @@ function repairPanel(r) {
         ${badge(r.status)}
       </div>
       ${r.error ? `<p class="error">${esc(r.error)}</p>` : ''}
-      <p class="hint">${esc(progress)}</p>
+      <p class="hint">${esc(progress + retrying)}</p>
       ${canApply ? `<div class="actions"><button data-action="apply-repair" data-target="${r.id}">补上 ${toFix.reduce((t, doc) => t + (doc.missing || 0), 0)} 张图</button></div>` : ''}
-      ${r.docs.length ? `
-        <div class="table-wrap">
+      ${docs.length ? `
+        <div class="table-wrap scroll-box" data-keep="repair-docs-${r.id}">
           <table>
             <thead><tr><th>文档</th><th>图表</th><th>待补</th><th>状态</th></tr></thead>
-            <tbody>${r.docs.map((doc) => `
+            <tbody>${docs.map((doc) => `
               <tr>
                 <td>
                   ${esc(doc.path)}
@@ -314,7 +331,7 @@ function repairPanel(r) {
           </table>
         </div>` : ''}
       ${unmatched.length ? `
-        <details class="unmatched">
+        <details class="unmatched" data-keep="repair-unmatched-${r.id}">
           <summary>${unmatched.length} 个源节点在新位置找不到同名节点，已跳过</summary>
           ${unmatched.map((path) => `<div class="hint-inline">${esc(path)}</div>`).join('')}
         </details>` : ''}

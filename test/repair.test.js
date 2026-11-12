@@ -8,6 +8,7 @@ const dataDir = mkdtempSync(join(tmpdir(), 'lark-export-repair-'));
 process.env.DATA_DIR = dataDir;
 process.env.LARK_APP_ID = 'a';
 process.env.LARK_APP_SECRET = 's';
+process.env.REPAIR_RETRY_DELAY_MS = '10';
 const { db } = await import('../src/db.js');
 const { applyRepair, listRepairs, matchByTitle, startRepair } = await import('../src/repair.js');
 const { writeDocx } = await import('../src/docx-writer.js');
@@ -34,7 +35,8 @@ const placeholder = (id) => line(id, '[未迁移的内容: 扩展组件]');
 const page = (id, children) => ({ block_id: id, block_type: 1, children });
 
 // Source tree: root > A, B, C, D. The target was migrated before diagrams were supported.
-function fakeLark() {
+// failures: document -> how many reads of it fail before it answers.
+function fakeLark(failures = {}) {
   const docs = {
     'o-root': [page('o-root', ['d0']), diagram('d0', 'graph TD; R')],
     'o-a': [page('o-a', ['t', 'd1', 'c']), line('t', '正文'), diagram('d1', 'graph TD; A1'), { block_id: 'c', block_type: 19, callout: {}, children: ['d2'] }, diagram('d2', 'graph TD; A2')],
@@ -80,6 +82,10 @@ function fakeLark() {
       writes.push({ op: 'delete', doc, parentId, start: body.start_index, end: body.end_index });
       docs[doc].find((b) => b.block_id === parentId).children.splice(body.start_index, body.end_index - body.start_index);
       return ok({});
+    }
+    if (doc && failures[doc] > 0) {
+      failures[doc]--;
+      return Response.json({ code: 1770002, msg: 'not found' });
     }
     if (doc) return ok({ items: docs[doc], has_more: false });
     return ok({ items: [], has_more: false });
@@ -180,4 +186,17 @@ test('migrating copies a Mermaid diagram as the same extension block', async () 
     add_ons: { component_type_id: 'blk_mermaid', record: diagram('m', 'graph TD; X').add_ons.record },
   });
   assert.deepEqual(warnings, []);
+});
+
+test('documents that fail are tried again on their own, and only lasting failures are shown', async () => {
+  // A: fails twice, then answers. B: never answers. Both are retried without anyone asking.
+  fakeLark({ 'o-a': 2, 'n-b': 99 });
+  const id = startRepair(SOURCE, TARGET);
+  const job = await until(id, ['scanned', 'failed']);
+  const states = Object.fromEntries(job.docs.map((d) => [d.path, d.state]));
+  assert.equal(states['总览 / A'], 'missing', 'recovered on a later round');
+  assert.equal(states['总览 / B'], 'failed');
+  assert.match(job.docs.find((d) => d.path === '总览 / B').error, /not found/);
+  assert.equal(job.progress.retrying, undefined, 'the retry note goes once the rounds are over');
+  assert.equal(job.progress.checked, 4);
 });
