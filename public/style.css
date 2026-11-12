@@ -184,6 +184,15 @@ button.link-button.danger:hover:not(:disabled) { color: var(--bad); }
 .badge.running, .badge.created, .badge.pending, .badge.reading, .badge.writing { color: var(--accent); background: var(--accent-soft); }
 .badge.partial, .badge.unsupported, .badge.placeholder, .badge.interrupted, .badge.paused, .badge.pausing { color: var(--warn); background: var(--warn-soft); }
 .badge.failed { color: var(--bad); background: var(--bad-soft); }
+.badge.fixed, .badge.complete { color: var(--ok); background: var(--ok-soft); }
+.badge.scanning, .badge.applying { color: var(--accent); background: var(--accent-soft); }
+.badge.scanned, .badge.missing, .badge.mismatch { color: var(--warn); background: var(--warn-soft); }
+
+.field { display: grid; gap: 6px; margin-bottom: 12px; font-size: 13px; color: var(--muted); }
+table td { vertical-align: top; }
+.table-wrap td:first-child { white-space: normal; min-width: 160px; }
+.unmatched { margin-top: 12px; font-size: 13px; }
+.unmatched summary { cursor: pointer; color: var(--muted); }
 
 .tiles {
   display: grid;

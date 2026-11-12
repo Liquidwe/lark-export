@@ -32,6 +32,13 @@ const STATUS_LABELS = {
   writing: '处理中',
   interrupted: '已中断',
   unsupported: '不支持',
+  scanning: '对比中',
+  scanned: '对比完成',
+  applying: '补全中',
+  missing: '待补全',
+  mismatch: '需手动处理',
+  complete: '无需补全',
+  fixed: '已补全',
 };
 const STAT_LABELS = {
   blocks: '内容块',
@@ -139,7 +146,7 @@ function renderAccount() {
     return;
   }
   const nav = me.role === 'admin'
-    ? `<a href="#/">我的迁移</a><a href="#/members">团队成员</a>`
+    ? `<a href="#/">我的迁移</a><a href="#/repair">补全图表</a><a href="#/members">团队成员</a>`
     : '';
   account.innerHTML = `
     <nav class="nav">${nav}</nav>
@@ -225,6 +232,93 @@ async function showAdminHome() {
     }
   });
   schedule(route, jobs.some((job) => isActive(job.status)));
+}
+
+async function showRepair() {
+  const repairs = await api('/api/admin/repairs');
+  renderInPlace(`
+    <h1>补全图表</h1>
+    <p class="sub">之前的版本迁移时，Mermaid 图等扩展组件被换成了“[未迁移的内容: 扩展组件]”。这里按源文档把它们补回原来的位置，不用重新迁移。</p>
+    <section class="panel">
+      <form id="repair">
+        <label class="field">源文档链接（旧组织）
+          <input id="repair-source" type="url" required value="${esc(draft.repairSource ?? '')}" placeholder="https://xxx.larksuite.com/wiki/..." />
+        </label>
+        <label class="field">迁移后的文档链接（新组织）
+          <input id="repair-target" type="url" required value="${esc(draft.repairTarget ?? '')}" placeholder="https://yyy.larksuite.com/wiki/..." />
+        </label>
+        <p class="hint">两个链接是同一篇文档迁移前后的位置，下面的子文档按标题一一对应。先对比，只读不写；确认结果后再补全。</p>
+        <div class="actions"><button type="submit">开始对比</button></div>
+      </form>
+      ${draft.error ? `<p class="error">${esc(draft.error)}</p>` : ''}
+    </section>
+    ${repairs.map(repairPanel).join('')}
+  `);
+  for (const [id, key] of [['repair-source', 'repairSource'], ['repair-target', 'repairTarget']]) {
+    document.getElementById(id).addEventListener('input', (e) => { draft[key] = e.target.value; });
+  }
+  document.getElementById('repair').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    try {
+      await api('/api/admin/repairs', { sourceUrl: draft.repairSource ?? '', targetUrl: draft.repairTarget ?? '' });
+      draft.repairSource = '';
+      draft.repairTarget = '';
+      draft.error = '';
+    } catch (err) {
+      draft.error = err.message;
+    }
+    showRepair();
+  });
+  schedule(route, repairs.some((r) => r.status === 'scanning' || r.status === 'applying'));
+}
+
+function repairPanel(r) {
+  const sum = (key) => r.docs.reduce((total, doc) => total + (doc[key] ?? 0), 0);
+  const byState = (state) => r.docs.filter((doc) => doc.state === state).length;
+  const toFix = r.docs.filter((doc) => doc.state === 'missing' || doc.state === 'failed');
+  const canApply = (r.status === 'scanned' || r.status === 'partial') && toFix.length;
+  const progress = r.status === 'scanning'
+    ? `已配对 ${r.progress.paired} 个节点 · 已检查 ${r.progress.checked} 篇文档`
+    : `${r.docs.length} 篇文档有图表，共 ${sum('diagrams')} 张 · 待补 ${sum('missing')} 张 · 已补 ${sum('restored')} 张${byState('mismatch') ? ` · ${byState('mismatch')} 篇需手动处理` : ''}`;
+  const unmatched = r.progress.unmatched ?? [];
+  return `
+    <section class="panel">
+      <div class="spread">
+        <p class="facts">
+          <a href="${esc(r.source_url)}" target="_blank" rel="noreferrer">${esc(r.source_url)}</a><br />
+          → <a href="${esc(r.target_url)}" target="_blank" rel="noreferrer">${esc(r.target_url)}</a><br />
+          ${esc(formatTime(r.created_at))}
+        </p>
+        ${badge(r.status)}
+      </div>
+      ${r.error ? `<p class="error">${esc(r.error)}</p>` : ''}
+      <p class="hint">${esc(progress)}</p>
+      ${canApply ? `<div class="actions"><button data-action="apply-repair" data-target="${r.id}">补上 ${toFix.reduce((t, doc) => t + (doc.missing || 0), 0)} 张图</button></div>` : ''}
+      ${r.docs.length ? `
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>文档</th><th>图表</th><th>待补</th><th>状态</th></tr></thead>
+            <tbody>${r.docs.map((doc) => `
+              <tr>
+                <td>
+                  ${esc(doc.path)}
+                  <div class="hint-inline"><a href="${esc(doc.sourceUrl)}" target="_blank" rel="noreferrer">源文档</a> · <a href="${esc(doc.targetUrl)}" target="_blank" rel="noreferrer">新文档</a></div>
+                  ${doc.state === 'mismatch' ? `<div class="note">新文档里有 ${doc.slots} 处图表或占位，源文档有 ${doc.diagrams} 张图，位置对不上，需要手动补</div>` : ''}
+                  ${doc.error ? `<div class="note bad">${esc(doc.error)}</div>` : ''}
+                </td>
+                <td class="number">${doc.diagrams ?? '-'}</td>
+                <td class="number">${doc.missing ?? '-'}</td>
+                <td>${badge(doc.state)}</td>
+              </tr>`).join('')}
+            </tbody>
+          </table>
+        </div>` : ''}
+      ${unmatched.length ? `
+        <details class="unmatched">
+          <summary>${unmatched.length} 个源节点在新位置找不到同名节点，已跳过</summary>
+          ${unmatched.map((path) => `<div class="hint-inline">${esc(path)}</div>`).join('')}
+        </details>` : ''}
+    </section>`;
 }
 
 const statusCell = (status) => (status ? badge(status) : '<span class="hint-inline">未开始</span>');
@@ -473,6 +567,15 @@ const ACTIONS = {
       location.hash = '#/';
     }
   },
+  'apply-repair': async ({ target }) => {
+    const lines = [
+      '会在新文档中把“[未迁移的内容: 扩展组件]”替换成源文档里对应的图表，其余内容不变。',
+      '标为“需手动处理”的文档不会改动。',
+    ];
+    if (await confirmDialog('补全这些图表？', lines, '开始补全')) {
+      await api(`/api/admin/repairs/${target}/apply`, {});
+    }
+  },
   'pause-export': ({ exportId }) => api(`/api/exports/${exportId}/pause`, {}),
   'resume-export': ({ exportId }) => api(`/api/exports/${exportId}/resume`, {}),
   'retry-failed': ({ exportId }) => api(`/api/exports/${exportId}/resume`, { retryFailed: true }),
@@ -664,6 +767,8 @@ async function route() {
       await showMemberHome(exportId);
     } else if (hash.startsWith('#/members')) {
       await showMembers();
+    } else if (hash.startsWith('#/repair')) {
+      await showRepair();
     } else if (exportId) {
       await showAdminExport(exportId);
     } else {

@@ -10,12 +10,12 @@ const BLOCK_NAMES = {
   8: 'heading6', 9: 'heading7', 10: 'heading8', 11: 'heading9', 12: 'bullet', 13: 'ordered',
   14: 'code', 15: 'quote', 17: 'todo', 19: 'callout', 22: 'divider', 24: 'grid',
   18: 'bitable', 25: 'grid_column', 26: 'iframe', 27: 'image', 23: 'file', 30: 'sheet', 31: 'table',
-  32: 'table_cell', 33: 'view', 34: 'quote_container', 43: 'board',
+  32: 'table_cell', 33: 'view', 34: 'quote_container', 40: 'add_ons', 43: 'board',
 };
 const TEXT_LIKE = new Set([2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 17]);
 const UNSUPPORTED_LABELS = {
   20: '群名片', 21: '流程图', 28: '第三方小组件', 29: '思维笔记',
-  35: '任务', 36: 'OKR', 40: '扩展组件', 999: '未知内容',
+  35: '任务', 36: 'OKR', 999: '未知内容',
 };
 const MAX_BLOCKS_PER_CALL = 500;
 const MAX_ROOTS_PER_CALL = 50;
@@ -171,11 +171,21 @@ async function fillEmbeddedBitable({ client, documentId, relations, bitable, ass
   });
 }
 
+export function addOnSource(block) {
+  try {
+    return JSON.parse(block.add_ons?.record ?? '{}').data ?? '';
+  } catch {
+    return '';
+  }
+}
+
 function emptyLine(id) {
   return { block_id: id, block_type: 2, text: { elements: [{ text_run: { content: '' } }] } };
 }
 
 function blockText(block) {
+  // A refused diagram keeps its source as text, which can be pasted back into a new diagram.
+  if (block.block_type === 40) return addOnSource(block);
   const elements = block[BLOCK_NAMES[block.block_type]]?.elements ?? [];
   return elements.map((e) => e.text_run?.content ?? e.equation?.content ?? '').join('');
 }
@@ -361,6 +371,12 @@ function toTargetBlock(source, ctx) {
       ctx.bitables.push({ id, table });
       return { block_id: id, block_type: 18, bitable: { view_type: source.bitable?.view_type ?? 1 }, __leaf: true };
     }
+    case 40: {
+      // Extensions such as Mermaid diagrams keep their source in record, and Lark accepts them back as they are.
+      const { component_type_id: componentTypeId, record } = source.add_ons ?? {};
+      if (!componentTypeId) return placeholder(id, ADDON_LABEL, ctx);
+      return { block_id: id, block_type: 40, add_ons: { component_type_id: componentTypeId, record }, __leaf: true };
+    }
     case 43:
       ctx.boards.push({ id, nodes: ctx.content.boards?.[id] ?? [] });
       return { block_id: id, block_type: 43, board: {}, __leaf: true };
@@ -379,6 +395,10 @@ function toTargetBlock(source, ctx) {
       return placeholder(id, `类型 ${type} 的内容`, ctx);
   }
 }
+
+// Earlier versions wrote this text in place of every extension block, which the repair looks for.
+export const ADDON_LABEL = '扩展组件';
+export const placeholderText = (label) => `[未迁移的内容: ${label}]`;
 
 function placeholder(id, label, ctx) {
   ctx.warn(`${label} 无法迁移，已替换为文字占位`);
@@ -401,7 +421,7 @@ function placeholderBlock(id, label) {
     block_type: 2,
     __leaf: true,
     text: {
-      elements: [{ text_run: { content: `[未迁移的内容: ${label}]`, text_element_style: { italic: true } } }],
+      elements: [{ text_run: { content: placeholderText(label), text_element_style: { italic: true } } }],
     },
   };
 }

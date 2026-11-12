@@ -29,6 +29,7 @@ import {
   startLibraryMigration,
   startMigration,
 } from './migrate.js';
+import { applyRepair, listRepairs, startRepair } from './repair.js';
 
 const PORT = Number(process.env.PORT || 4310);
 const HOST = process.env.HOST || '127.0.0.1';
@@ -311,6 +312,21 @@ async function handleApi(req, res, url) {
     return send(res, 200, { ok: true });
   }
 
+  if (req.method === 'GET' && path === '/api/admin/repairs') {
+    requireAdmin(req);
+    return send(res, 200, listRepairs());
+  }
+  if (req.method === 'POST' && path === '/api/admin/repairs') {
+    requireAdmin(req);
+    const { sourceUrl, targetUrl } = await readJson(req);
+    return send(res, 201, { id: startRepair(sourceUrl ?? '', targetUrl ?? '') });
+  }
+  if (req.method === 'POST' && (match = path.match(/^\/api\/admin\/repairs\/(\d+)\/apply$/))) {
+    requireAdmin(req);
+    await readJson(req);
+    applyRepair(Number(match[1]));
+    return send(res, 200, { ok: true });
+  }
   if (req.method === 'GET' && path === '/api/admin/members') {
     requireAdmin(req);
     return send(res, 200, memberOverview());

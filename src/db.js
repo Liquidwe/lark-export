@@ -104,6 +104,18 @@ db.exec(`
     expires_at INTEGER NOT NULL
   );
 
+  CREATE TABLE IF NOT EXISTS repairs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_url TEXT NOT NULL,
+    target_url TEXT NOT NULL,
+    status TEXT NOT NULL,
+    error TEXT,
+    docs TEXT NOT NULL,
+    progress TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    finished_at INTEGER
+  );
+
   CREATE TABLE IF NOT EXISTS lark_accounts (
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     side TEXT NOT NULL,
@@ -133,6 +145,7 @@ addColumn('nodes', 'space', "TEXT NOT NULL DEFAULT 'wiki'");
 db.exec(`
   UPDATE exports SET status = 'interrupted' WHERE status IN ('running', 'pausing');
   UPDATE migrations SET status = 'interrupted' WHERE status IN ('running', 'pausing');
+  UPDATE repairs SET status = 'interrupted' WHERE status IN ('scanning', 'applying');
   UPDATE nodes SET status = 'pending' WHERE status = 'reading';
 `);
 
